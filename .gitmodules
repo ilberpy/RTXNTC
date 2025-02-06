@@ -1,0 +1,15 @@
+[submodule "external/donut"]
+	path = external/donut
+	url = https://github.com/NVIDIA-RTX/Donut.git
+[submodule "external/lodepng"]
+	path = external/lodepng
+	url = https://github.com/lvandeve/lodepng.git
+[submodule "external/DLSS"]
+	path = external/DLSS
+	url = https://github.com/NVIDIA/DLSS.git
+[submodule "libraries/RTXTF-Library"]
+	path = libraries/RTXTF-Library
+	url = ../RTXTF-Library.git
+[submodule "libraries/RTXNTC-Library"]
+	path = libraries/RTXNTC-Library
+	url = ../RTXNTC-Library.git

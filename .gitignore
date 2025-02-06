@@ -1,0 +1,9 @@
+/build*
+/bin
+/data
+/.vscode
+/.vs
+/*.zip
+*.pyc
+/assets/testscratch
+/external/dx12-agility-sdk
