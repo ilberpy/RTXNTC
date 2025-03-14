@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
  *
  * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
@@ -16,6 +16,8 @@
 #include <nvrhi/nvrhi.h>
 #include <filesystem>
 #include <unordered_map>
+
+#include "feedbackmanager/include/FeedbackManager.h"
 
 struct NtcMaterial;
 class GraphicsDecompressionPass;
@@ -48,7 +50,11 @@ public:
     bool IsCooperativeVectorFP8Supported() const { return m_coopVecFP8; }
 
     bool LoadMaterialsForScene(donut::engine::Scene& scene, std::filesystem::path const& materialDir, 
-        bool enableInferenceOnLoad, bool enableBlockCompression, bool enableInferenceOnSample);
+        bool enableInferenceOnLoad, bool enableBlockCompression, bool enableInferenceOnSample,
+        bool enableInferenceOnFeedback, std::shared_ptr<nvfeedback::FeedbackManager> feedbackManager);
+
+    bool TranscodeTile(const NtcMaterial& material, const nvfeedback::FeedbackTextureTile& tile, nvrhi::ICommandList* commandList,
+        bool onlyAlphaMask, bool enableBlockCompression);
 
 private:
     nvrhi::DeviceHandle m_device;
@@ -64,10 +70,20 @@ private:
     std::shared_ptr<GraphicsDecompressionPass> m_graphicsDecompressionPass;
     std::shared_ptr<GraphicsBlockCompressionPass> m_graphicsBlockCompressionPass;
 
-    bool TranscodeMaterial(ntc::IStream* ntcFile, ntc::StreamRange streamRange,
+    // Textures for tile-based decompression and recompression
+    std::vector<nvrhi::TextureHandle> m_texTileColorR8;
+    std::vector<nvrhi::TextureHandle> m_texTileColorRGBA;
+    std::vector<nvrhi::TextureHandle> m_texTileColorSRGBA;
+    nvrhi::TextureHandle m_texTileBlocksRG;
+    nvrhi::TextureHandle m_texTileBlocksRGBA;
+
+    bool TranscodeMaterial(ntc::IStream* ntcFile,
         ntc::ITextureSetMetadata* textureSetMetadata, NtcMaterial& material, nvrhi::ICommandList* commandList,
         bool enableBlockCompression, bool onlyAlphaMask);
 
-    bool PrepareMaterialForInferenceOnSample(ntc::IStream* ntcFile, ntc::StreamRange streamRange,
+    bool PrepareMaterialForInferenceOnSample(ntc::IStream* ntcFile,
         ntc::ITextureSetMetadata* textureSetMetadata, NtcMaterial& material, nvrhi::ICommandList* commandList);
+
+    bool PrepareFeedbackMaterial(std::shared_ptr<nvfeedback::FeedbackManager> feedbackManager,
+        ntc::ITextureSetMetadata* textureSetMetadata, NtcMaterial& material, nvrhi::ICommandList* commandList, bool enableBlockCompression);
 };

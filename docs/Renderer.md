@@ -1,6 +1,6 @@
 # NTC Renderer
 
-The Renderer is a sample application that loads a [glTF](https://www.khronos.org/gltf/) model with materials pre-converted into NTC texture sets, and renders that model using either Inference on Sample or Inference on Load with optional transcoding into BCn.
+The Renderer is a sample application that loads a [glTF](https://www.khronos.org/gltf/) model with materials pre-converted into NTC texture sets, and renders that model using Inference on Sample, Inference on Load with optional transcoding into BCn, or Inference on Feedback. The Inference on Feedback mode is only available when running on Windows using DX12 due to the lack of a Vulkan equivalent of the DX12 [Sampler Feedback](https://microsoft.github.io/DirectX-Specs/d3d/SamplerFeedback.html) feature.
 
 ![Screenshot](../docs/images/renderer-full.jpg)
 
@@ -52,13 +52,14 @@ ntc-renderer <path/to/model.gltf>
 By default, it should load the model with NTC materials and display it in the Inference on Sample mode, with a runtime option to switch to material textures transcoded to BCn on load. Either mode can be disabled through the command line to speed up loading and/or reduce memory consumption, using the `--no-...` arguments.
 
 ```sh
---no-inferenceOnLoad    # disables texture transcoding on load
---no-inferenceOnSample  # disables the Inference on Sample mode
---no-blockCompression   # disables BCn encoding on load, decompressed textures will be kept uncompressed
---no-coopVec            # disables all CoopVec features
---no-coopVecInt8        # disables the Int8 CoopVec features
---no-coopVecFP8         # disables the FP8 CoopVec features
---referenceMaterials    # disables NTC and loads the model with its original materials instead
+--no-inferenceOnLoad      # disables texture transcoding on load
+--no-inferenceOnSample    # disables the Inference on Sample mode
+--no-inferenceOnFeedback  # disables the Inference on Feedback mode
+--no-blockCompression     # disables BCn encoding on load, decompressed textures will be kept uncompressed
+--no-coopVec              # disables all CoopVec features
+--no-coopVecInt8          # disables the Int8 CoopVec features
+--no-coopVecFP8           # disables the FP8 CoopVec features
+--referenceMaterials      # disables NTC and loads the model with its original materials instead
 ```
 
 Other supported command line arguments are:
@@ -82,3 +83,19 @@ The `Save Screenshot` button will save the current rnedered image into a file. T
 ## Source Code
 
 Material loading and transcoding happens in [`NtcMaterialLoader.cpp`](/samples/renderer/NtcMaterialLoader.cpp). Inference on Sample happens in [`NtcForwardShadingPass.hlsl`](/samples/renderer/NtcForwardShadingPass.hlsl) and it CoopVec/Slang version, [`NtcForwardShadingPass_CoopVec.slang`](/samples/renderer/NtcForwardShadingPass_CoopVec.slang). You can also see the shader permutations declared in the [`Shaders.cfg`](/samples/renderer/Shaders.cfg) file. Other source files don't really have any code that uses or implements NTC.
+
+## Inference on Feedback Mode
+
+The Inference on Feedback mode a variation of the Inference on Load functionality and is entirely implemented in the Renderer sample app. It relies on being able to decompress 2D parts or tiles of texture sets and then encode those tiles into BCn.
+
+In essence, Inference on Feedback implements a streaming virtual texturing system using Tiled Resources and with NTC texture sets as the data origin. There are several key parts in the implementation:
+
+1. The [`NtcMaterialLoader`](../samples/renderer/NtcMaterialLoader.cpp) component loads all NTC texture set data from disk and into VRAM, just as it would for Inference on Sample. It also prepares temporary textures for decompressing a single tile (up to 512x512 pixels) into all color channels, such as Base Color, Normals, Roughness, etc. Finally, for every used texture slot in every material, a `FeedbackTexture` object is created - it consists of a tiled resource used for sampling the texture, initially unmapped, and a sampler feedback resource.
+
+2. The [`NtcForwardShadingPass`](../samples/renderer/NtcForwardShadingPass.cpp) component is responsible for drawing geometry using all three supported modes (Inference on Load, Sample, Feedback). In the Feedback mode, it uses a special pixel shader [`ForwardShadingPassFeedback.hlsl`](../samples/renderer/ForwardShadingPassFeedback.hlsl) that samples the material textures assuming that some of their tiles may be unmapped, in which case it will try coarser mip levels until it finds a mapped tile. The pixel shader also records the texels that were (or would be) accessed by this sample operation in the corresponding sampler feedback resource.
+
+3. The main render loop in [`NtcSceneRenderer.cpp`](../samples/renderer/NtcSceneRenderer.cpp) uses the [FeedbackManager](../samples/renderer/feedbackmanager/src/FeedbackManager.cpp) component to read the sampler feedback and come up with a list of texture tiles that should be mapped and transcoded on the current frame. See the `ProcessInferenceOnFeedback` function. The texture tiles are then mapped, and the `NtcMaterialLoader` decompresses every tile from NTC into color textures and encodes them into BCn, storing the results in the tiles just mapped.
+
+4. The [FeedbackManager](../samples/renderer/feedbackmanager/src/FeedbackManager.cpp) component manages the tiled resources and processes the sampler feedback. It relies on the [RTXTS-TTM](https://github.com/NVIDIA-RTX/RTXTS-TTM) library - the Tiled Texture Manager from the [RTX Texture Streaming SDK](https://github.com/NVIDIA-RTX/RTXTS). RTXTS-TTM implements the logic that manages tile allocations and releases, and the `FeedbackManager` interfaces that library with DX12 through [NVRHI](https://github.com/NVIDIA-RTX/NVRHI).
+
+Depending on the scene, view and rendering algorithm, Inference on Feedback can achive significant memory savings compared to using fully mapped BCn textures, up to 6x in our testing - and that includes the compressed NTC textures being resident in video memory. There is some GPU and CPU overhead due to the sampler feedback being recorded during rendering and processed on the CPU on every frame; this overhead may be significant in the sample app that runs at several hundreds of frames per second, but less noticeable in games with more realistic performance. The implementation in the Renderer sample could also be optimized, for example by batching the transcoding of texture tiles, or by using a single sampler feedback resource for all textures in each material, or by streaming tiles of NTC latents on-demand.

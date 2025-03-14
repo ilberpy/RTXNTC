@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
  *
  * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
@@ -25,6 +25,7 @@
     #endif
     #include "compiled_shaders/NtcForwardShadingPass.dxil.h"
     #include "compiled_shaders/LegacyForwardShadingPass.dxil.h"
+    #include "compiled_shaders/ForwardShadingPassFeedback.dxil.h"
     // This shader comes from Donut - see CMakeLists.txt that adds an include path to .../donut/shaders
     #include "compiled_shaders/passes/forward_vs_buffer_loads.dxil.h"
 #endif
@@ -80,40 +81,48 @@ nvrhi::ShaderHandle NtcForwardShadingPass::GetOrCreatePixelShader(PipelineKey ke
     defines.push_back({ "TRANSMISSIVE_MATERIAL", transmissiveMaterial ? "1": "0" });
     defines.push_back({ "ENABLE_ALPHA_TEST", alphaTestedMaterial ? "1" : "0" });
 
-    if (key.legacyMaterials)
-    {
-        defines.push_back({ "USE_STF", key.useSTF ? "1" : "0" });
-    }
-    else
-    {
-        defines.push_back({ "NETWORK_VERSION", networkVersion });
-        if (useCoopVec)
-            defines.push_back({ "USE_FP8", weightType == ntc::InferenceWeightType::CoopVecFP8 ? "1" : "0"});
-    }
-
     nvrhi::ShaderHandle pixelShader;
-    if (key.legacyMaterials)
+    switch (key.ntcMode)
     {
-        pixelShader = m_shaderFactory->CreateStaticPlatformShader(
-            DONUT_MAKE_PLATFORM_SHADER(g_LegacyForwardShadingPass),
-            &defines, nvrhi::ShaderType::Pixel);
-    }
-    else
-    {
-        if (useCoopVec)
-        {
+        case NtcMode::InferenceOnSample:
+            defines.push_back({ "NETWORK_VERSION", networkVersion });
+            if (useCoopVec)
+                defines.push_back({ "USE_FP8", weightType == ntc::InferenceWeightType::CoopVecFP8 ? "1" : "0"});
+
+            if (useCoopVec)
+            {
 #if NTC_WITH_COOPVEC
-            pixelShader = m_shaderFactory->CreateStaticPlatformShader(
-                DONUT_MAKE_PLATFORM_SHADER(g_NtcForwardShadingPass_CoopVec),
-                &defines, nvrhi::ShaderType::Pixel);
+                pixelShader = m_shaderFactory->CreateStaticPlatformShader(
+                    DONUT_MAKE_PLATFORM_SHADER(g_NtcForwardShadingPass_CoopVec),
+                    &defines, nvrhi::ShaderType::Pixel);
 #endif
-        }
-        else
-        {
+            }
+            else
+            {
+                pixelShader = m_shaderFactory->CreateStaticPlatformShader(
+                    DONUT_MAKE_PLATFORM_SHADER(g_NtcForwardShadingPass),
+                    &defines, nvrhi::ShaderType::Pixel);
+            }
+            break;
+
+        case NtcMode::InferenceOnLoad:
+            defines.push_back({ "USE_STF", key.useSTF ? "1" : "0" });
             pixelShader = m_shaderFactory->CreateStaticPlatformShader(
-                DONUT_MAKE_PLATFORM_SHADER(g_NtcForwardShadingPass),
+                DONUT_MAKE_PLATFORM_SHADER(g_LegacyForwardShadingPass),
                 &defines, nvrhi::ShaderType::Pixel);
-        }
+            break;
+
+        case NtcMode::InferenceOnFeedback:
+            defines.push_back({ "USE_STF", key.useSTF ? "1" : "0" });
+            pixelShader = m_shaderFactory->CreateStaticPlatformShader(
+                donut::engine::StaticShader(), // dxbc - irrelevant
+                DONUT_MAKE_DXIL_SHADER(g_ForwardShadingPassFeedback_dxil),
+                donut::engine::StaticShader(), // spirv - feedback not supported
+                &defines, nvrhi::ShaderType::Pixel);
+            break;
+
+        default:
+            assert(!"Unknown ntcMode");
     }
 
     m_pixelShaders[key] = pixelShader;
@@ -122,7 +131,7 @@ nvrhi::ShaderHandle NtcForwardShadingPass::GetOrCreatePixelShader(PipelineKey ke
 
 nvrhi::GraphicsPipelineHandle NtcForwardShadingPass::GetOrCreatePipeline(PipelineKey key, nvrhi::IFramebuffer* framebuffer)
 {
-    if (key.legacyMaterials)
+    if (key.ntcMode != NtcMode::InferenceOnSample)
     {
         key.networkVersion = 0;
         key.weightType = 0;
@@ -143,12 +152,29 @@ nvrhi::GraphicsPipelineHandle NtcForwardShadingPass::GetOrCreatePipeline(Pipelin
     pipelineDesc.VS = m_vertexShader;
     pipelineDesc.renderState.rasterState.frontCounterClockwise = key.frontCounterClockwise;
     pipelineDesc.renderState.rasterState.setCullMode(key.cullMode);
-    pipelineDesc.bindingLayouts = {
-        key.legacyMaterials
-            ? m_legacyMaterialBindingCache->GetLayout()
-            : key.networkVersion == NTC_NETWORK_UNKNOWN 
+    nvrhi::IBindingLayout* materialBindingLayout = nullptr;
+    switch(key.ntcMode)
+    {
+        case NtcMode::InferenceOnSample:
+            materialBindingLayout = key.networkVersion == NTC_NETWORK_UNKNOWN 
                 ? (nvrhi::IBindingLayout*)m_emptyMaterialBindingLayout 
-                : (nvrhi::IBindingLayout*)m_materialBindingLayout,
+                : (nvrhi::IBindingLayout*)m_materialBindingLayout;
+            break;
+
+        case NtcMode::InferenceOnLoad:
+            materialBindingLayout = m_legacyMaterialBindingCache->GetLayout();
+            break;
+
+        case NtcMode::InferenceOnFeedback:
+            materialBindingLayout = m_materialBindingLayoutFeedback;
+            break;
+
+        default:
+            assert(!"Unknown ntcMode");
+    }
+
+    pipelineDesc.bindingLayouts = {
+        materialBindingLayout,
         m_inputBindingLayout,
         m_viewBindingLayout,
         m_shadingBindingLayout };
@@ -231,6 +257,53 @@ nvrhi::BindingSetHandle NtcForwardShadingPass::GetOrCreateMaterialBindingSet(Ntc
     return bindingSet;
 }
 
+static nvrhi::BindingSetItem GetReservedBindingSetItem(uint32_t slot,
+    nvrhi::RefCountPtr<nvfeedback::FeedbackTexture> const& texture, nvrhi::ITexture* fallback)
+{
+    if (texture)
+        return nvrhi::BindingSetItem::Texture_SRV(slot, texture->GetReservedTexture().Get());
+    return nvrhi::BindingSetItem::Texture_SRV(slot, fallback);
+}
+
+static nvrhi::BindingSetItem GetFeedbackBindingSetItem(uint32_t slot,
+    nvrhi::RefCountPtr<nvfeedback::FeedbackTexture> const& texture)
+{
+    if (texture)
+        return nvrhi::BindingSetItem::SamplerFeedbackTexture_UAV(slot, texture->GetSamplerFeedbackTexture().Get());
+    return nvrhi::BindingSetItem::SamplerFeedbackTexture_UAV(slot, nullptr);
+}
+
+nvrhi::BindingSetHandle NtcForwardShadingPass::GetOrCreateMaterialBindingSetFeedback(NtcMaterial const* material)
+{
+    auto found = m_materialBindingSetsFeedback.find(material);
+    if (found != m_materialBindingSetsFeedback.end())
+        return found->second;
+
+    auto const fallbackTexture = m_commonPasses->m_GrayTexture;
+    auto bindingSetDesc = nvrhi::BindingSetDesc()
+        .addItem(nvrhi::BindingSetItem::ConstantBuffer(FORWARD_BINDING_MATERIAL_CONSTANTS, material->materialConstants))
+        .addItem(GetReservedBindingSetItem(FORWARD_BINDING_MATERIAL_DIFFUSE_TEXTURE,      material->baseOrDiffuseTextureFeedback,        fallbackTexture))
+        .addItem(GetReservedBindingSetItem(FORWARD_BINDING_MATERIAL_SPECULAR_TEXTURE,     material->metalRoughOrSpecularTextureFeedback, fallbackTexture))
+        .addItem(GetReservedBindingSetItem(FORWARD_BINDING_MATERIAL_NORMAL_TEXTURE,       material->normalTextureFeedback,               fallbackTexture))
+        .addItem(GetReservedBindingSetItem(FORWARD_BINDING_MATERIAL_EMISSIVE_TEXTURE,     material->emissiveTextureFeedback,             fallbackTexture))
+        .addItem(GetReservedBindingSetItem(FORWARD_BINDING_MATERIAL_OCCLUSION_TEXTURE,    material->occlusionTextureFeedback,            fallbackTexture))
+        .addItem(GetReservedBindingSetItem(FORWARD_BINDING_MATERIAL_TRANSMISSION_TEXTURE, material->transmissionTextureFeedback,         fallbackTexture))
+        .addItem(GetReservedBindingSetItem(FORWARD_BINDING_MATERIAL_OPACITY_TEXTURE,      material->opacityTextureFeedback,              fallbackTexture))
+        .addItem(GetFeedbackBindingSetItem(FORWARD_BINDING_MATERIAL_DIFFUSE_TEXTURE,      material->baseOrDiffuseTextureFeedback))
+        .addItem(GetFeedbackBindingSetItem(FORWARD_BINDING_MATERIAL_SPECULAR_TEXTURE,     material->metalRoughOrSpecularTextureFeedback))
+        .addItem(GetFeedbackBindingSetItem(FORWARD_BINDING_MATERIAL_NORMAL_TEXTURE,       material->normalTextureFeedback))
+        .addItem(GetFeedbackBindingSetItem(FORWARD_BINDING_MATERIAL_EMISSIVE_TEXTURE,     material->emissiveTextureFeedback))
+        .addItem(GetFeedbackBindingSetItem(FORWARD_BINDING_MATERIAL_OCCLUSION_TEXTURE,    material->occlusionTextureFeedback))
+        .addItem(GetFeedbackBindingSetItem(FORWARD_BINDING_MATERIAL_TRANSMISSION_TEXTURE, material->transmissionTextureFeedback))
+        .addItem(GetFeedbackBindingSetItem(FORWARD_BINDING_MATERIAL_OPACITY_TEXTURE,      material->opacityTextureFeedback))
+    ;
+
+    nvrhi::BindingSetHandle bindingSet = m_device->createBindingSet(bindingSetDesc, m_materialBindingLayoutFeedback);
+ 
+    m_materialBindingSetsFeedback[material] = bindingSet;
+    return bindingSet;    
+}
+
 std::shared_ptr<donut::engine::MaterialBindingCache> NtcForwardShadingPass::CreateLegacyMaterialBindingCache(
     donut::engine::CommonRenderPasses& commonPasses)
 {
@@ -302,6 +375,31 @@ bool NtcForwardShadingPass::Init()
 
     m_materialBindingLayout = m_device->createBindingLayout(materialLayoutDesc);
 
+    if (m_device->queryFeatureSupport(nvrhi::Feature::SamplerFeedback))
+    {
+        auto materialLayoutFeedbackDesc = nvrhi::BindingLayoutDesc()
+            .setVisibility(nvrhi::ShaderType::Pixel)
+            .setRegisterSpace(FORWARD_SPACE_MATERIAL)
+            .setRegisterSpaceIsDescriptorSet(true)
+            .addItem(nvrhi::BindingLayoutItem::ConstantBuffer(FORWARD_BINDING_MATERIAL_CONSTANTS))
+            .addItem(nvrhi::BindingLayoutItem::Texture_SRV(FORWARD_BINDING_MATERIAL_DIFFUSE_TEXTURE))
+            .addItem(nvrhi::BindingLayoutItem::Texture_SRV(FORWARD_BINDING_MATERIAL_SPECULAR_TEXTURE))
+            .addItem(nvrhi::BindingLayoutItem::Texture_SRV(FORWARD_BINDING_MATERIAL_NORMAL_TEXTURE))
+            .addItem(nvrhi::BindingLayoutItem::Texture_SRV(FORWARD_BINDING_MATERIAL_EMISSIVE_TEXTURE))
+            .addItem(nvrhi::BindingLayoutItem::Texture_SRV(FORWARD_BINDING_MATERIAL_OCCLUSION_TEXTURE))
+            .addItem(nvrhi::BindingLayoutItem::Texture_SRV(FORWARD_BINDING_MATERIAL_TRANSMISSION_TEXTURE))
+            .addItem(nvrhi::BindingLayoutItem::Texture_SRV(FORWARD_BINDING_MATERIAL_OPACITY_TEXTURE))
+            .addItem(nvrhi::BindingLayoutItem::SamplerFeedbackTexture_UAV(FORWARD_BINDING_MATERIAL_DIFFUSE_FEEDBACK_UAV))
+            .addItem(nvrhi::BindingLayoutItem::SamplerFeedbackTexture_UAV(FORWARD_BINDING_MATERIAL_SPECULAR_FEEDBACK_UAV))
+            .addItem(nvrhi::BindingLayoutItem::SamplerFeedbackTexture_UAV(FORWARD_BINDING_MATERIAL_NORMAL_FEEDBACK_UAV))
+            .addItem(nvrhi::BindingLayoutItem::SamplerFeedbackTexture_UAV(FORWARD_BINDING_MATERIAL_EMISSIVE_FEEDBACK_UAV))
+            .addItem(nvrhi::BindingLayoutItem::SamplerFeedbackTexture_UAV(FORWARD_BINDING_MATERIAL_OCCLUSION_FEEDBACK_UAV))
+            .addItem(nvrhi::BindingLayoutItem::SamplerFeedbackTexture_UAV(FORWARD_BINDING_MATERIAL_TRANSMISSION_FEEDBACK_UAV))
+            .addItem(nvrhi::BindingLayoutItem::SamplerFeedbackTexture_UAV(FORWARD_BINDING_MATERIAL_OPACITY_FEEDBACK_UAV));
+
+        m_materialBindingLayoutFeedback = m_device->createBindingLayout(materialLayoutFeedbackDesc);
+    }
+
     auto inputBindingLayoutDesc = nvrhi::BindingLayoutDesc()
         .setVisibility(nvrhi::ShaderType::Vertex)
         .setRegisterSpace(FORWARD_SPACE_INPUT)
@@ -346,6 +444,8 @@ bool NtcForwardShadingPass::Init()
 void NtcForwardShadingPass::ResetBindingCache()
 {
     m_materialBindingSets.clear();
+    m_materialBindingSetsFeedback.clear();
+    m_legacyMaterialBindingCache->Clear();
 }
 
 void NtcForwardShadingPass::PrepareLights(
@@ -378,14 +478,14 @@ donut::engine::ViewType::Enum NtcForwardShadingPass::GetSupportedViewTypes() con
 }
 
 void NtcForwardShadingPass::PreparePass(Context& context, nvrhi::ICommandList* commandList, uint32_t frameIndex,
-    bool useSTF, int stfFilterMode, bool hasDepthPrepass, bool legacyMaterials)
+    bool useSTF, int stfFilterMode, bool hasDepthPrepass, NtcMode ntcMode)
 {
     NtcForwardShadingPassConstants passConstants {};
     passConstants.frameIndex = frameIndex;
     passConstants.stfFilterMode = stfFilterMode;
     commandList->writeBuffer(m_passConstants, &passConstants, sizeof(passConstants));
     context.keyTemplate.hasDepthPrepass = hasDepthPrepass;
-    context.keyTemplate.legacyMaterials = legacyMaterials;
+    context.keyTemplate.ntcMode = ntcMode;
     context.keyTemplate.useSTF = useSTF;
 }
 
@@ -422,11 +522,24 @@ bool NtcForwardShadingPass::SetupMaterial(
     key.networkVersion = ntcMaterial->networkVersion;
     key.weightType = ntcMaterial->weightType;
 
-    nvrhi::IBindingSet* materialBindingSet;
-    if (key.legacyMaterials)
-        materialBindingSet = m_legacyMaterialBindingCache->GetMaterialBindingSet(ntcMaterial);
-    else
-        materialBindingSet = GetOrCreateMaterialBindingSet(ntcMaterial);
+    nvrhi::IBindingSet* materialBindingSet = nullptr;
+    switch(key.ntcMode)
+    {
+        case NtcMode::InferenceOnSample:
+            materialBindingSet = GetOrCreateMaterialBindingSet(ntcMaterial);
+            break;
+
+        case NtcMode::InferenceOnLoad:
+            materialBindingSet = m_legacyMaterialBindingCache->GetMaterialBindingSet(ntcMaterial);
+            break;
+
+        case NtcMode::InferenceOnFeedback:
+            materialBindingSet = GetOrCreateMaterialBindingSetFeedback(ntcMaterial);
+            break;
+
+        default:
+            assert(!"Unknown ntcMode");
+    }
 
     if (!materialBindingSet)
         return false;

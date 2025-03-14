@@ -1,4 +1,4 @@
-# Neural Texture Compression (NTC) SDK v0.5.0 BETA
+# Neural Texture Compression (NTC) SDK v0.6.0 BETA
 
 [Quick Start Guide](#quick-start-guide)
 
@@ -6,7 +6,7 @@
 
 Neural Texture Compression (NTC) is an algorithm designed to compress all PBR textures used for a single material together. It works best when the texture channels are correlated with each other, for example, detail in the albedo texture corresponds to detail in the normal texture. Up to 16 texture channels can be compressed into one NTC texture set. Typical PBR materials have 9-10 channels: 3x albedo, 3x normal, metalness, roughness, ambient occlusion, opacity.
 
-During compression, the original texture data is transformed into a combination of weights for a small neural network (decoder) and a tensor of latents or features that are sampled and passed through the decoder to reconstruct the texture colors, as is illustrated below. The sampling and decoding processes are fast enough to use them directly in the shaders that normally sample the material textures, such as base pass pixel shaders or ray tracing hit shaders. However, the decoder produces unfiltered data for only one texel, and in order to get filtered textures, we suggest using NTC in combination with [Stochastic Texture Filtering (STF)](https://github.com/NVIDIA-RTX/RTXTF). For renderers targeting lower-end hardware, we suggest implementing the "Inference on Load" mode where NTC textures are decompressed when the game or map is loaded, and transcoded to one of the block-compressed formats (BCn) at the same time.
+During compression, the original texture data is transformed into a combination of weights for a small neural network (decoder) and a tensor of latents or features that are sampled and passed through the decoder to reconstruct the texture colors, as is illustrated below. The sampling and decoding processes are fast enough to use them directly in the shaders that normally sample the material textures, such as base pass pixel shaders or ray tracing hit shaders. However, the decoder produces unfiltered data for only one texel, and in order to get filtered textures, we suggest using NTC in combination with [Stochastic Texture Filtering (STF)](https://github.com/NVIDIA-RTX/RTXTF). For renderers targeting lower-end hardware, we suggest implementing the "Inference on Load" mode where NTC textures are decompressed when the game or map is loaded, and transcoded to one of the block-compressed formats (BCn) at the same time. There is also an advanced "Inference on Feedback" mode that uses Sampler Feedback to find the set of texture tiles needed to render the current view and then decompresses only those tiles, storing them in a sparse tiled texture as BCn.
 
 ![NTC Decoding Pipeline](docs/images/ntc-pipeline.png)
 
@@ -201,6 +201,8 @@ Further details about specific usages of `LibNTC` can be found divided by topic 
         * [Transcoding to BCn and image comparison](docs/integration/BlockCompression.md)
     * On Sample
         * [Inference on Sample using Cooporative Vector](docs/integration/InferenceOnSample.md)
+    * On Feedback
+        * See the [Inference on Feedback section](docs/Renderer.md#inference-on-feedback-mode) in the Renderer's Readme file.
 
 The [NTC Explorer](docs/Explorer.md) and [NTC Renderer](docs/Renderer.md) samples demonstrate using `LibNTC` for compression and decompression and can be used as a further reference for what an integrated content workflow might look like.
 

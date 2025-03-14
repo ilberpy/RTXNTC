@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
  *
  * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
@@ -14,6 +14,13 @@
 
 struct NtcMaterial;
 
+enum class NtcMode
+{
+    InferenceOnSample,
+    InferenceOnLoad,
+    InferenceOnFeedback
+};
+
 class NtcForwardShadingPass : public donut::render::IGeometryPass
 {
 protected:
@@ -26,7 +33,7 @@ protected:
         bool frontCounterClockwise = false;
         bool reverseDepth = false;
         bool hasDepthPrepass = false;
-        bool legacyMaterials = false;
+        NtcMode ntcMode = NtcMode::InferenceOnSample;
         bool useSTF = false;
 
         bool operator==(PipelineKey const& other) const
@@ -38,7 +45,7 @@ protected:
                    frontCounterClockwise == other.frontCounterClockwise &&
                    reverseDepth == other.reverseDepth &&
                    hasDepthPrepass == other.hasDepthPrepass &&
-                   legacyMaterials == other.legacyMaterials &&
+                   ntcMode == other.ntcMode &&
                    useSTF == other.useSTF;
         }
 
@@ -60,7 +67,7 @@ protected:
             nvrhi::hash_combine(hash, s.frontCounterClockwise);
             nvrhi::hash_combine(hash, s.reverseDepth);
             nvrhi::hash_combine(hash, s.hasDepthPrepass);
-            nvrhi::hash_combine(hash, s.legacyMaterials);
+            nvrhi::hash_combine(hash, uint32_t(s.ntcMode));
             nvrhi::hash_combine(hash, s.useSTF);
             return hash;
         }
@@ -82,8 +89,10 @@ protected:
     
     nvrhi::BindingLayoutHandle m_materialBindingLayout;
     nvrhi::BindingLayoutHandle m_emptyMaterialBindingLayout;
+    nvrhi::BindingLayoutHandle m_materialBindingLayoutFeedback;
     nvrhi::BindingLayoutHandle m_inputBindingLayout;
     std::unordered_map<NtcMaterial const*, nvrhi::BindingSetHandle> m_materialBindingSets;
+    std::unordered_map<NtcMaterial const*, nvrhi::BindingSetHandle> m_materialBindingSetsFeedback;
     std::unordered_map<const donut::engine::BufferGroup*, nvrhi::BindingSetHandle> m_inputBindingSets;
 
     nvrhi::InputLayoutHandle m_inputLayout;
@@ -94,6 +103,7 @@ protected:
     nvrhi::ShaderHandle GetOrCreatePixelShader(PipelineKey key);
     nvrhi::GraphicsPipelineHandle GetOrCreatePipeline(PipelineKey key, nvrhi::IFramebuffer* framebuffer);
     nvrhi::BindingSetHandle GetOrCreateMaterialBindingSet(NtcMaterial const* material);
+    nvrhi::BindingSetHandle GetOrCreateMaterialBindingSetFeedback(NtcMaterial const* material);
     nvrhi::BindingSetHandle CreateInputBindingSet(const donut::engine::BufferGroup* bufferGroup);
     nvrhi::BindingSetHandle GetOrCreateInputBindingSet(const donut::engine::BufferGroup* bufferGroup);
     std::shared_ptr<donut::engine::MaterialBindingCache> CreateLegacyMaterialBindingCache(donut::engine::CommonRenderPasses& commonPasses);
@@ -130,7 +140,7 @@ public:
         dm::float3 ambientColorBottom);
 
     void PreparePass(Context& context, nvrhi::ICommandList* commandList, uint32_t frameIndex,
-        bool useSTF, int stfFilterMode, bool hasDepthPrepass, bool legacyMaterials);
+        bool useSTF, int stfFilterMode, bool hasDepthPrepass, NtcMode ntcMode);
 
     // IGeometryPass implementation
 

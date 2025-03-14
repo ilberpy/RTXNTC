@@ -33,6 +33,19 @@ target_sources(ntc-renderer PRIVATE
     RenderTargets.h
 )
 
+file(GLOB feedback_sources
+    feedbackmanager/include/*.h
+    feedbackmanager/src/*.h
+    feedbackmanager/src/*.cpp
+    ../../external/RTXTS-TTM/include/rtxts-ttm/*.h
+    ../../external/RTXTS-TTM/src/*.h
+    ../../external/RTXTS-TTM/src/*.cpp
+)
+
+if (DONUT_WITH_DX12)
+    target_sources(ntc-renderer PRIVATE ${feedback_sources})
+endif()
+
 if (TARGET DLSS)
     target_sources(ntc-renderer PRIVATE 
         DLSS.cpp
@@ -72,13 +85,15 @@ set(shader_sources
     LegacyForwardShadingPass.hlsl
     NtcForwardShadingPass_CoopVec.slang
     NtcForwardShadingPass.hlsl
+    ForwardShadingPassFeedback.hlsl
 )
 
 set(shader_output_dir "${CMAKE_CURRENT_BINARY_DIR}/compiled_shaders")
 
 set(shader_outputs
     NtcForwardShadingPass
-    LegacyForwardShadingPass)
+    LegacyForwardShadingPass
+    ForwardShadingPassFeedback)
 
 set(shader_outputs_slang
     NtcForwardShadingPass_CoopVec)
@@ -89,6 +104,7 @@ set(libstf_include_directory "${CMAKE_SOURCE_DIR}/libraries/RTXTF-Library")
 target_include_directories(ntc-renderer PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
 target_include_directories(ntc-renderer PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/../../external/donut/shaders")
 target_include_directories(ntc-renderer PRIVATE "${libstf_include_directory}")
+target_include_directories(ntc-renderer PRIVATE "${CMAKE_SOURCE_DIR}/external/RTXTS-TTM/include")
 
 add_custom_target(ntc-renderer-shaders
     DEPENDS ShaderMake

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
  *
  * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
@@ -35,6 +35,10 @@
 #include <sstream>
 #include <chrono>
 #include <STFDefinitions.h>
+#include <argparse.h>
+#include <sstream>
+#include <chrono>
+#include <algorithm>
 
 #include "NtcMaterialLoader.h"
 #include "NtcMaterial.h"
@@ -62,6 +66,7 @@ struct
     bool blockCompression = true;
     bool inferenceOnLoad = true;
     bool inferenceOnSample = true;
+    bool inferenceOnFeedback = true;
     bool enableCoopVec = true;
     bool enableCoopVecInt8 = true;
     bool enableCoopVecFP8 = true;
@@ -84,6 +89,7 @@ bool ProcessCommandLine(int argc, const char** argv)
         OPT_BOOLEAN(0, "blockCompression", &g_options.blockCompression, "Enable transcoding to BCn (default on, use --no-blockCompression)"),
         OPT_BOOLEAN(0, "inferenceOnLoad", &g_options.inferenceOnLoad, "Enable inference on load (default on, use --no-inferenceOnLoad)"),
         OPT_BOOLEAN(0, "inferenceOnSample", &g_options.inferenceOnSample, "Enable inference on sample (default on, use --no-inferenceOnSample)"),
+        OPT_BOOLEAN(0, "inferenceOnFeedback", &g_options.inferenceOnFeedback, "Enable inference on feedback (default on, use --no-inferenceOnFeedback)"),
         OPT_BOOLEAN(0, "coopVec", &g_options.enableCoopVec, "Enable all CoopVec extensions (default on, use --no-coopVec)"),
         OPT_BOOLEAN(0, "coopVecFP8", &g_options.enableCoopVecFP8, "Enable CoopVec extensions for FP8 math (default on, use --no-coopVecFP8)"),
         OPT_BOOLEAN(0, "coopVecInt8", &g_options.enableCoopVecInt8, "Enable CoopVec extensions for Int8 math (default on, use --no-coopVecInt8)"),
@@ -182,11 +188,17 @@ bool ProcessCommandLine(int argc, const char** argv)
     {
         g_options.inferenceOnLoad = false;
         g_options.inferenceOnSample = false;
+        g_options.inferenceOnFeedback = false;
     }
     else if (!g_options.inferenceOnLoad && !g_options.inferenceOnSample)
     {
         log::error("The options --no-inferenceOnLoad and --no-inferenceOnSample cannot be used together.");
         return false;
+    }
+
+    if (!g_options.useDX12)
+    {
+        g_options.inferenceOnFeedback = false;
     }
 
     return true;
@@ -227,11 +239,18 @@ enum class AntiAliasingMode
 #endif
 };
 
+struct RequestedTile
+{
+    nvfeedback::FeedbackTexture* texture;
+    uint32_t tileIndex;
+    nvfeedback::FeedbackTextureTile tile;
+};
+
 class NtcSceneRenderer : public app::ImGui_Renderer
 {
 private:
     nvrhi::CommandListHandle m_commandList;
-    
+
     RenderTargets m_renderTargets;
 
     
@@ -253,6 +272,12 @@ private:
     std::unique_ptr<DLSS> m_DLSS;
 #endif
 
+    // Feedback mode related members
+    std::shared_ptr<nvfeedback::FeedbackManager> m_feedbackManager;
+    std::unordered_map<nvfeedback::FeedbackTexture*, donut::engine::LoadedTexture*> m_loadedTexturesByFeedback;
+    std::unordered_map<nvfeedback::FeedbackTexture*, NtcMaterial*> m_materialsByFeedback;
+    std::queue<RequestedTile> m_requestedTiles;
+
     app::SwitchableCamera m_camera;
     engine::PlanarView m_view;
     engine::PlanarView m_previousView;
@@ -263,7 +288,7 @@ private:
     bool m_enableVsync = false;
     bool m_useSTF = true;
     int m_stfFilterMode = STF_FILTER_TYPE_CUBIC;
-    bool m_inferenceOnSample = true;
+    NtcMode m_ntcMode = NtcMode::InferenceOnSample;
     std::string m_screenshotFileName;
     bool m_screenshotWithUI = true;
     bool m_useDepthPrepass = true;
@@ -300,6 +325,21 @@ public:
 #endif
 
         ImGui::GetIO().IniFilename = nullptr;
+
+#if NTC_WITH_DX12
+        if (g_options.inferenceOnFeedback)
+        {
+            nvfeedback::FeedbackManagerDesc fmDesc = {};
+            fmDesc.heapSizeInTiles = 100;
+            fmDesc.numFramesInFlight = GetDeviceManager()->GetBackBufferCount();
+            m_feedbackManager = std::shared_ptr<nvfeedback::FeedbackManager>(nvfeedback::CreateFeedbackManager(GetDevice(), fmDesc));
+        }
+#endif
+    }
+
+    ~NtcSceneRenderer()
+    {
+        m_scene.reset();
     }
 
     bool LoadScene(std::shared_ptr<vfs::IFileSystem> fs, const std::filesystem::path& sceneFileName) 
@@ -315,7 +355,7 @@ public:
             fs::path const materialDir = g_options.materialDir ? fs::path(g_options.materialDir) : fs::path();
 
             if (!m_materialLoader->LoadMaterialsForScene(*m_scene, materialDir,
-                g_options.inferenceOnLoad, g_options.blockCompression, g_options.inferenceOnSample))
+                g_options.inferenceOnLoad, g_options.blockCompression, g_options.inferenceOnSample, g_options.inferenceOnFeedback, m_feedbackManager))
             {
                 return false;
             }
@@ -344,6 +384,41 @@ public:
                 NtcMaterial const& ntcMaterial = static_cast<NtcMaterial const&>(*material);
                 m_ntcTextureMemorySize += ntcMaterial.ntcMemorySize;
                 m_transcodedTextureMemorySize += ntcMaterial.transcodedMemorySize;
+            }
+        }
+
+        if (g_options.inferenceOnFeedback)
+        {
+            for (std::shared_ptr<engine::Material> const& material : m_scene->GetSceneGraph()->GetMaterials())
+            {
+                NtcMaterial const& ntcMaterial = static_cast<NtcMaterial const&>(*material);
+                
+                auto add_texture = [this](std::shared_ptr<donut::engine::LoadedTexture> loadedTexture, nvrhi::RefCountPtr<nvfeedback::FeedbackTexture> feedbackTexture)
+                    {
+                        m_loadedTexturesByFeedback[feedbackTexture.Get()] = loadedTexture.get();
+                    };
+
+                add_texture(ntcMaterial.baseOrDiffuseTexture, ntcMaterial.baseOrDiffuseTextureFeedback);
+                add_texture(ntcMaterial.metalRoughOrSpecularTexture, ntcMaterial.metalRoughOrSpecularTextureFeedback);
+                add_texture(ntcMaterial.normalTexture, ntcMaterial.normalTextureFeedback);
+                add_texture(ntcMaterial.emissiveTexture, ntcMaterial.emissiveTextureFeedback);
+                add_texture(ntcMaterial.occlusionTexture, ntcMaterial.occlusionTextureFeedback);
+                add_texture(ntcMaterial.transmissionTexture, ntcMaterial.transmissionTextureFeedback);
+                add_texture(ntcMaterial.opacityTexture, ntcMaterial.opacityTextureFeedback);
+
+                auto add_material = [this](NtcMaterial* material, nvrhi::RefCountPtr<nvfeedback::FeedbackTexture> feedbackTexture)
+                    {
+                        m_materialsByFeedback[feedbackTexture.Get()] = material;
+                    };
+
+                NtcMaterial* materialPtr = static_cast<NtcMaterial*>(material.get());
+                add_material(materialPtr, ntcMaterial.baseOrDiffuseTextureFeedback);
+                add_material(materialPtr, ntcMaterial.metalRoughOrSpecularTextureFeedback);
+                add_material(materialPtr, ntcMaterial.normalTextureFeedback);
+                add_material(materialPtr, ntcMaterial.emissiveTextureFeedback);
+                add_material(materialPtr, ntcMaterial.occlusionTextureFeedback);
+                add_material(materialPtr, ntcMaterial.transmissionTextureFeedback);
+                add_material(materialPtr, ntcMaterial.opacityTextureFeedback);
             }
         }
 
@@ -420,7 +495,7 @@ public:
         depthParams.numConstantBufferVersions = 128;
         m_depthPass->Init(*m_shaderFactory, depthParams);
 
-        m_inferenceOnSample = g_options.inferenceOnSample;
+        m_ntcMode = g_options.inferenceOnSample ? NtcMode::InferenceOnSample : NtcMode::InferenceOnLoad;
 
         void const* pFontData;
         size_t fontSize;
@@ -583,25 +658,25 @@ public:
 
         render::InstancedOpaqueDrawStrategy opaqueDrawStrategy;
         render::TransparentDrawStrategy transparentDrawStrategy;
+	
+        if (m_useDepthPrepass)
+        {
+            m_prePassTimer.beginQuery(m_commandList);
 
-            if (m_useDepthPrepass)
-            {
-                m_prePassTimer.beginQuery(m_commandList);
+            render::DepthPass::Context depthContext;
+            render::RenderCompositeView(commandList, &m_view, &m_view, *m_renderTargets.depthFramebufferFactory,
+                m_scene->GetSceneGraph()->GetRootNode(), opaqueDrawStrategy, *m_depthPass,
+                depthContext, "Depth Pre-pass");
 
-                render::DepthPass::Context depthContext;
-                render::RenderCompositeView(commandList, &m_view, &m_view, *m_renderTargets.depthFramebufferFactory,
-                    m_scene->GetSceneGraph()->GetRootNode(), opaqueDrawStrategy, *m_depthPass,
-                    depthContext, "Depth Pre-pass");
-
-                m_prePassTimer.endQuery(m_commandList);
-            }
+            m_prePassTimer.endQuery(m_commandList);
+        }
 
         NtcForwardShadingPass::Context forwardContext;
         m_ntcForwardShadingPass->PrepareLights(commandList, { m_light },
             skyParameters.skyColor * skyParameters.brightness,
             skyParameters.groundColor * skyParameters.brightness);
         m_ntcForwardShadingPass->PreparePass(forwardContext, commandList, GetFrameIndex(),
-            m_useSTF, m_stfFilterMode, m_useDepthPrepass, !m_inferenceOnSample);
+            m_useSTF, m_stfFilterMode, m_useDepthPrepass, m_ntcMode);
 
         m_renderPassTimer.beginQuery(m_commandList);
 
@@ -632,6 +707,155 @@ public:
     bool ShouldRenderUnfocused() override
     {
         return true;
+    }
+
+    void ProcessInferenceOnFeedback()
+    {
+        nvfeedback::FeedbackTextureCollection tilesThisFrame;
+        std::unordered_map<NtcMaterial*, std::vector<nvfeedback::FeedbackTextureTile>> materialsAndTiles;
+
+        {
+            // Phase 1: Begin frame, readback feedback
+            
+            m_commandList->open();
+
+            nvfeedback::FeedbackUpdateConfig fconfig = {};
+            fconfig.frameIndex = GetDeviceManager()->GetCurrentBackBufferIndex();
+            fconfig.maxTexturesToUpdate = 10;
+            fconfig.tileTimeoutSeconds = 2;
+            fconfig.defragmentHeaps = true;
+            fconfig.releaseEmptyHeaps = true;
+            nvfeedback::FeedbackTextureCollection updatedTextures = {};
+            m_feedbackManager->BeginFrame(m_commandList, fconfig, &updatedTextures);
+
+            // Requested packed tiles this frame, will always be mapped
+            std::vector<RequestedTile> requestedPackedTiles;
+
+            // Collect all tiles and store them in the queue
+            for (nvfeedback::FeedbackTextureUpdate& texUpdate : updatedTextures.textures)
+            {
+                RequestedTile reqTile;
+                reqTile.texture = texUpdate.texture;
+                for (uint32_t i = 0; i < texUpdate.tiles.size(); i++)
+                {
+                    reqTile.tile = texUpdate.tiles[i];
+                    reqTile.tileIndex = texUpdate.tileIndices[i];
+                    if (reqTile.tile.isPacked)
+                        requestedPackedTiles.push_back(reqTile);
+                    else
+                        m_requestedTiles.push(reqTile);
+                }
+            }
+
+            m_commandList->close();
+            GetDevice()->executeCommandList(m_commandList);
+
+            // Check the queue and figure out how many tiles we will mapped this frame
+            if (!requestedPackedTiles.empty() || !m_requestedTiles.empty())
+            {
+                // This schedules a tile to be mapped this frame
+                auto scheduleTileToMap = [&](const RequestedTile& reqTile)
+                    {
+                        // Find if we already have this texture in tilesThisFrame
+                        nvfeedback::FeedbackTextureUpdate* pTexUpdate = nullptr;
+                        for (uint32_t t = 0; t < tilesThisFrame.textures.size(); t++)
+                        {
+                            if (tilesThisFrame.textures[t].texture == reqTile.texture)
+                            {
+                                pTexUpdate = &tilesThisFrame.textures[t];
+                                break;
+                            }
+                        }
+
+                        if (pTexUpdate == nullptr)
+                        {
+                            // First time we see this texture this frame
+                            nvfeedback::FeedbackTextureUpdate texUpdate;
+                            texUpdate.texture = reqTile.texture;
+                            tilesThisFrame.textures.push_back(texUpdate);
+                            pTexUpdate = &tilesThisFrame.textures.back();
+                        }
+
+                        if (!reqTile.tile.isPacked)
+                        {
+                            for (uint32_t t = 0; t < pTexUpdate->tileIndices.size(); t++)
+                            {
+                                assert(pTexUpdate->tileIndices[t] != reqTile.tileIndex);
+                            }
+                        }
+
+                        pTexUpdate->tiles.push_back(reqTile.tile);
+                        pTexUpdate->tileIndices.push_back(reqTile.tileIndex);
+                    };
+
+                // Map and transcode only numTilesMax tiles per frame to reduce frametime spikes
+                uint32_t numTilesMax = 64;
+                uint32_t countThisFrame = std::min((uint32_t)m_requestedTiles.size(), numTilesMax);
+                for (uint32_t i = 0; i < countThisFrame; i++)
+                {
+                    scheduleTileToMap(m_requestedTiles.front());
+                    m_requestedTiles.pop();
+                }
+
+                // Map and transcode all packed tiles this frame
+                for (auto& packedTile : requestedPackedTiles)
+                    scheduleTileToMap(packedTile);
+
+                // Collect a set of NtcMaterials and tiles as we will transcode all textures in a material simultaneously
+                for (auto& textureUpdate : tilesThisFrame.textures)
+                {
+                    NtcMaterial* material = m_materialsByFeedback[textureUpdate.texture];
+                    assert(material);
+
+                    if (materialsAndTiles.find(material) == materialsAndTiles.end())
+                    {
+                        materialsAndTiles[material] = std::vector<nvfeedback::FeedbackTextureTile>();
+                    }
+
+                    auto& tileset = materialsAndTiles[material];
+                    for (auto& tile : textureUpdate.tiles)
+                    {
+                        if (std::find(tileset.begin(), tileset.end(), tile) == tileset.end())
+                        {
+                            tileset.push_back(tile);
+
+                            auto desc = material->textureSetMetadata->Get()->GetDesc();
+                            assert(tile.x + tile.width <= desc.width);
+                            assert(tile.y + tile.height <= desc.height);
+                        }
+                    }
+                }
+            }
+        }
+
+        {
+            // Phase 2: Update tile mappings
+
+            m_commandList->open();
+            m_feedbackManager->UpdateTileMappings(m_commandList, &tilesThisFrame);
+            m_commandList->close();
+            GetDevice()->executeCommandList(m_commandList);
+        }
+
+        {
+            // Phase 3: Decode NTC texture tiles
+
+            m_commandList->open();
+            for (auto& pair : materialsAndTiles)
+            {
+                NtcMaterial* ntcmaterial = pair.first;
+                std::vector<nvfeedback::FeedbackTextureTile> tileset = pair.second;
+
+                for (auto& tile : tileset)
+                {
+                    // Now decode the tile
+                    m_materialLoader->TranscodeTile(*ntcmaterial, tile, m_commandList, false, g_options.blockCompression);
+                }
+            }
+
+            m_commandList->close();
+            GetDevice()->executeCommandList(m_commandList);
+        }
     }
 
     void Render(nvrhi::IFramebuffer* framebuffer) override
@@ -669,6 +893,14 @@ public:
         }
 #endif
 
+        // Inference on Feedback mode
+        if (m_ntcMode == NtcMode::InferenceOnFeedback)
+        {
+            ProcessInferenceOnFeedback();
+        }
+
+        // Scene rendering
+        
         m_commandList->open();
 
         m_commandList->clearDepthStencilTexture(m_renderTargets.depth, nvrhi::AllSubresources, true, 0.f, false, 0);
@@ -701,6 +933,19 @@ public:
         GetDevice()->executeCommandList(m_commandList);
 
         m_prePassTimer.update();
+        
+        // Resolve feedback
+        if (m_ntcMode == NtcMode::InferenceOnFeedback)
+        {
+            m_commandList->open();
+
+            m_feedbackManager->ResolveFeedback(m_commandList);
+            m_feedbackManager->EndFrame();
+
+            m_commandList->close();
+            GetDevice()->executeCommandList(m_commandList);
+        }
+
         m_renderPassTimer.update();
         m_previousFrameValid = true;
 
@@ -731,12 +976,21 @@ public:
             char const* textureType = "";
             if (g_options.referenceMaterials)
                 textureType = "Reference Textures (PNGs etc.)";
-            else if (m_inferenceOnSample)
-                textureType = "NTC Inference on Sample";
-            else if (g_options.blockCompression)
-                textureType = "NTC Transcoded to BCn";
-            else
-                textureType = "NTC Decompressed on Load";
+            switch (m_ntcMode)
+            {
+                case NtcMode::InferenceOnSample:
+                    textureType = "NTC Inference on Sample";
+                    break;
+                case NtcMode::InferenceOnLoad:
+                    if (g_options.blockCompression)
+                        textureType = "NTC Transcoded to BCn";
+                    else
+                        textureType = "NTC Decompressed on Load";
+                    break;
+                case NtcMode::InferenceOnFeedback:
+                    textureType = "NTC Inference on Feedback";
+                    break;
+            }
 
             ImGui::TextUnformatted(textureType);
             
@@ -747,10 +1001,18 @@ public:
             }
             else
             {
-                if (m_inferenceOnSample)
+                switch (m_ntcMode)
+                {
+                case NtcMode::InferenceOnSample:
                     textureMemorySize = m_ntcTextureMemorySize;
-                else
+                    break;
+                case NtcMode::InferenceOnLoad:
                     textureMemorySize += m_transcodedTextureMemorySize;
+                    break;
+                case NtcMode::InferenceOnFeedback:
+                    textureMemorySize = size_t(m_feedbackManager->GetStats().heapAllocationInBytes) + m_ntcTextureMemorySize;
+                    break;
+                }
             }
             ImGui::Text("Texture Memory: %.2f MB", float(textureMemorySize) / 1048576.f);
             
@@ -815,21 +1077,40 @@ public:
 
             if (!g_options.referenceMaterials)
             {
-                // If one of the modes is unavailable, disable the checkbox and force to use the other mode
-                bool const disableSelection = !g_options.inferenceOnLoad || !g_options.inferenceOnSample;
-                ImGui::BeginDisabled(disableSelection);
-                ImGui::Checkbox("Inference On Sample", &m_inferenceOnSample);
+                ImGui::TextUnformatted("NTC Mode:");
+                ImGui::BeginDisabled(!g_options.inferenceOnLoad);
+                if (ImGui::RadioButton("Load", m_ntcMode == NtcMode::InferenceOnLoad))
+                {
+                    m_ntcMode = NtcMode::InferenceOnLoad;
+                }
+                ImGui::EndDisabled();
+                ImGui::SameLine();
+                ImGui::BeginDisabled(!g_options.inferenceOnSample);
+                if (ImGui::RadioButton("Sample", m_ntcMode == NtcMode::InferenceOnSample))
+                {
+                    m_ntcMode = NtcMode::InferenceOnSample;
+                }
+                ImGui::EndDisabled();
+                ImGui::SameLine();
+                ImGui::BeginDisabled(!g_options.inferenceOnFeedback);
+                if (ImGui::RadioButton("Feedback", m_ntcMode == NtcMode::InferenceOnFeedback))
+                {
+                    m_ntcMode = NtcMode::InferenceOnFeedback;
+                }
                 ImGui::EndDisabled();
 
-                if (disableSelection)
-                    m_inferenceOnSample = g_options.inferenceOnSample;
+                // Ensure we have selected an enabled mode
+                if (m_ntcMode == NtcMode::InferenceOnFeedback && !g_options.inferenceOnFeedback)
+                    m_ntcMode = NtcMode::InferenceOnSample;
+                if (m_ntcMode == NtcMode::InferenceOnSample && !g_options.inferenceOnSample)
+                    m_ntcMode = NtcMode::InferenceOnLoad;
             }
 
-            bool effectiveUseSTF = m_inferenceOnSample ? true : m_useSTF;
-            ImGui::BeginDisabled(m_inferenceOnSample);
+            bool effectiveUseSTF = (m_ntcMode == NtcMode::InferenceOnSample) ? true : m_useSTF;
+            ImGui::BeginDisabled(m_ntcMode == NtcMode::InferenceOnSample);
             ImGui::Checkbox("Use STF", &effectiveUseSTF);
             ImGui::EndDisabled();
-            if (!m_inferenceOnSample)
+            if (m_ntcMode != NtcMode::InferenceOnSample)
                 m_useSTF = effectiveUseSTF;
 
             {
@@ -873,6 +1154,26 @@ public:
             }
             ImGui::EndDisabled();
 #endif
+
+            if (m_ntcMode == NtcMode::InferenceOnFeedback)
+            {
+                ImGui::Separator();
+                ImGui::TextUnformatted("Feedback stats:");
+                nvfeedback::FeedbackManagerStats stats = m_feedbackManager->GetStats();
+                constexpr uint64_t tileSizeInBytes = 65536; // D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES
+                constexpr double megabyte = 1'048'576;
+                double tilesTotalMb = double(uint64_t(stats.tilesTotal) * tileSizeInBytes) / megabyte;
+                ImGui::Text("Tiles Total: %d (%.0f MB)", stats.tilesTotal, tilesTotalMb);
+                ImGui::Text("Tiles Allocated: %d (%.0f MB)", stats.tilesAllocated, double(uint64_t(stats.tilesAllocated) * tileSizeInBytes) / megabyte);
+                double tilesHeapAllocatedMb = double(stats.heapAllocationInBytes) / megabyte;
+                ImGui::Text("Heap Allocation: %.0f MB", tilesHeapAllocatedMb);
+                double ntcMemoryMb = double(m_ntcTextureMemorySize) / megabyte;
+                ImGui::Text("NTC Memory: %.0f MB", ntcMemoryMb);
+                double plusNtcMemory = tilesHeapAllocatedMb + ntcMemoryMb;
+                ImGui::Text("Net Memory Savings: %.2fx (%.0f MB)", tilesTotalMb / plusNtcMemory, tilesTotalMb - plusNtcMemory);
+            }
+
+            ImGui::Separator();
 
             if (ImGui::Button("Save Screenshot..."))
             {
