@@ -171,7 +171,7 @@ static bool LoadMaterialFile(fs::path const& ntcFileName, NtcMaterial& material,
     return true;
 }
 
-bool NtcMaterialLoader::TranscodeTile(const NtcMaterial& material, const nvfeedback::FeedbackTextureTile& tile,
+bool NtcMaterialLoader::TranscodeTile(const NtcMaterial& material, const nvfeedback::FeedbackTextureTileInfo& tile,
     nvrhi::ICommandList* commandList, bool onlyAlphaMask, bool enableBlockCompression)
 {
     struct TextureVersions
@@ -312,10 +312,10 @@ bool NtcMaterialLoader::TranscodeTile(const NtcMaterial& material, const nvfeedb
     alphaDesc.descriptorIndex = 0;
 
     ntc::Rect rectDecompress;
-    rectDecompress.left = tile.x;
-    rectDecompress.top = tile.y;
-    rectDecompress.width = std::min(tile.width, mipWidth); // Tiles can be block sizes of 4x4 while the mip could be smaller
-    rectDecompress.height = std::min(tile.height, mipHeight);
+    rectDecompress.left = tile.xInTexels;
+    rectDecompress.top = tile.yInTexels;
+    rectDecompress.width = std::min(tile.widthInTexels, mipWidth); // Tiles can be block sizes of 4x4 while the mip could be smaller
+    rectDecompress.height = std::min(tile.heightInTexels, mipHeight);
 
     ntc::Point offsetDecompress;
     offsetDecompress.x = 0;
@@ -376,12 +376,12 @@ bool NtcMaterialLoader::TranscodeTile(const NtcMaterial& material, const nvfeedb
         }
 
         nvrhi::TextureSlice textureSliceDst = {};
-        textureSliceDst.x = tile.x;
-        textureSliceDst.y = tile.y;
+        textureSliceDst.x = tile.xInTexels;
+        textureSliceDst.y = tile.yInTexels;
         textureSliceDst.z = 0;
         textureSliceDst.mipLevel = tile.mip;
-        textureSliceDst.width = tile.width;
-        textureSliceDst.height = tile.height;
+        textureSliceDst.width = tile.widthInTexels;
+        textureSliceDst.height = tile.heightInTexels;
         textureSliceDst.depth = 1;
 
         TextureVersions const& textureVersions = materialTextures[textureIndex];
@@ -390,8 +390,8 @@ bool NtcMaterialLoader::TranscodeTile(const NtcMaterial& material, const nvfeedb
             float const alphaThreshold = 1.f / 255.f;
 
             ntc::MakeBlockCompressionComputePassParameters compressionParams;
-            compressionParams.srcRect.width = std::min(tile.width, mipWidth); // Tiles can be block sizes of 4x4 while the mip is smaller
-            compressionParams.srcRect.height = std::min(tile.height, mipHeight);
+            compressionParams.srcRect.width = std::min(tile.widthInTexels, mipWidth); // Tiles can be block sizes of 4x4 while the mip is smaller
+            compressionParams.srcRect.height = std::min(tile.heightInTexels, mipHeight);
             compressionParams.dstFormat = textureVersions.bcFormat;
             compressionParams.alphaThreshold = alphaThreshold;
             compressionParams.texture = textureMetadata;
@@ -416,8 +416,8 @@ bool NtcMaterialLoader::TranscodeTile(const NtcMaterial& material, const nvfeedb
             textureSliceSrc.y = 0;
             textureSliceSrc.z = 0;
             textureSliceSrc.mipLevel = 0;
-            textureSliceSrc.width = (tile.width + 3) / 4;
-            textureSliceSrc.height = (tile.height + 3) / 4;
+            textureSliceSrc.width = (tile.widthInTexels + 3) / 4;
+            textureSliceSrc.height = (tile.heightInTexels + 3) / 4;
             textureSliceSrc.depth = 1;
 
             commandList->copyTexture(pDestTexture, textureSliceDst, textureVersions.blocks, textureSliceSrc);
@@ -429,8 +429,8 @@ bool NtcMaterialLoader::TranscodeTile(const NtcMaterial& material, const nvfeedb
             textureSliceSrc.y = 0;
             textureSliceSrc.z = 0;
             textureSliceSrc.mipLevel = 0;
-            textureSliceSrc.width = tile.width;
-            textureSliceSrc.height = tile.height;
+            textureSliceSrc.width = tile.widthInTexels;
+            textureSliceSrc.height = tile.heightInTexels;
             textureSliceSrc.depth = 1;
 
             commandList->copyTexture(pDestTexture, textureSliceDst, textureVersions.color, textureSliceSrc);

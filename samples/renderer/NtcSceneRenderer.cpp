@@ -243,7 +243,6 @@ struct RequestedTile
 {
     nvfeedback::FeedbackTexture* texture;
     uint32_t tileIndex;
-    nvfeedback::FeedbackTextureTile tile;
 };
 
 class NtcSceneRenderer : public app::ImGui_Renderer
@@ -712,12 +711,16 @@ public:
     void ProcessInferenceOnFeedback()
     {
         nvfeedback::FeedbackTextureCollection tilesThisFrame;
-        std::unordered_map<NtcMaterial*, std::vector<nvfeedback::FeedbackTextureTile>> materialsAndTiles;
+        std::unordered_map<NtcMaterial*, std::vector<nvfeedback::FeedbackTextureTileInfo>> materialsAndTiles;
 
         {
             // Phase 1: Begin frame, readback feedback
             
             m_commandList->open();
+
+            // Use 10% of the total number of managed tiles as the max number of standby tiles
+            nvfeedback::FeedbackManagerStats statsLastFrame = m_feedbackManager->GetStats();
+            uint32_t standByTileCount = statsLastFrame.tilesTotal / 10;
 
             nvfeedback::FeedbackUpdateConfig fconfig = {};
             fconfig.frameIndex = GetDeviceManager()->GetCurrentBackBufferIndex();
@@ -725,6 +728,7 @@ public:
             fconfig.tileTimeoutSeconds = 2;
             fconfig.defragmentHeaps = true;
             fconfig.releaseEmptyHeaps = true;
+            fconfig.maxStandbyTiles = standByTileCount;
             nvfeedback::FeedbackTextureCollection updatedTextures = {};
             m_feedbackManager->BeginFrame(m_commandList, fconfig, &updatedTextures);
 
@@ -736,11 +740,10 @@ public:
             {
                 RequestedTile reqTile;
                 reqTile.texture = texUpdate.texture;
-                for (uint32_t i = 0; i < texUpdate.tiles.size(); i++)
+                for (uint32_t i = 0; i < texUpdate.tileIndices.size(); i++)
                 {
-                    reqTile.tile = texUpdate.tiles[i];
                     reqTile.tileIndex = texUpdate.tileIndices[i];
-                    if (reqTile.tile.isPacked)
+                    if (texUpdate.texture->IsTilePacked(reqTile.tileIndex))
                         requestedPackedTiles.push_back(reqTile);
                     else
                         m_requestedTiles.push(reqTile);
@@ -776,15 +779,6 @@ public:
                             pTexUpdate = &tilesThisFrame.textures.back();
                         }
 
-                        if (!reqTile.tile.isPacked)
-                        {
-                            for (uint32_t t = 0; t < pTexUpdate->tileIndices.size(); t++)
-                            {
-                                assert(pTexUpdate->tileIndices[t] != reqTile.tileIndex);
-                            }
-                        }
-
-                        pTexUpdate->tiles.push_back(reqTile.tile);
                         pTexUpdate->tileIndices.push_back(reqTile.tileIndex);
                     };
 
@@ -802,6 +796,7 @@ public:
                     scheduleTileToMap(packedTile);
 
                 // Collect a set of NtcMaterials and tiles as we will transcode all textures in a material simultaneously
+                std::vector<nvfeedback::FeedbackTextureTileInfo> tiles;
                 for (auto& textureUpdate : tilesThisFrame.textures)
                 {
                     NtcMaterial* material = m_materialsByFeedback[textureUpdate.texture];
@@ -809,19 +804,23 @@ public:
 
                     if (materialsAndTiles.find(material) == materialsAndTiles.end())
                     {
-                        materialsAndTiles[material] = std::vector<nvfeedback::FeedbackTextureTile>();
+                        materialsAndTiles[material] = std::vector<nvfeedback::FeedbackTextureTileInfo>();
                     }
 
                     auto& tileset = materialsAndTiles[material];
-                    for (auto& tile : textureUpdate.tiles)
+                    for (auto& tileIndex : textureUpdate.tileIndices)
                     {
-                        if (std::find(tileset.begin(), tileset.end(), tile) == tileset.end())
+                        textureUpdate.texture->GetTileInfo(tileIndex, tiles);
+                        for (auto& tile : tiles)
                         {
-                            tileset.push_back(tile);
+                            if (std::find(tileset.begin(), tileset.end(), tile) == tileset.end())
+                            {
+                                tileset.push_back(tile);
 
-                            auto desc = material->textureSetMetadata->Get()->GetDesc();
-                            assert(tile.x + tile.width <= desc.width);
-                            assert(tile.y + tile.height <= desc.height);
+                                auto desc = material->textureSetMetadata->Get()->GetDesc();
+                                assert(tile.xInTexels + tile.widthInTexels <= desc.width);
+                                assert(tile.yInTexels + tile.heightInTexels <= desc.height);
+                            }
                         }
                     }
                 }
@@ -844,7 +843,7 @@ public:
             for (auto& pair : materialsAndTiles)
             {
                 NtcMaterial* ntcmaterial = pair.first;
-                std::vector<nvfeedback::FeedbackTextureTile> tileset = pair.second;
+                std::vector<nvfeedback::FeedbackTextureTileInfo> tileset = pair.second;
 
                 for (auto& tile : tileset)
                 {
@@ -974,29 +973,10 @@ public:
             ImGui::PushFont(m_largerFont->GetScaledFont());
 
             char const* textureType = "";
-            if (g_options.referenceMaterials)
-                textureType = "Reference Textures (PNGs etc.)";
-            switch (m_ntcMode)
-            {
-                case NtcMode::InferenceOnSample:
-                    textureType = "NTC Inference on Sample";
-                    break;
-                case NtcMode::InferenceOnLoad:
-                    if (g_options.blockCompression)
-                        textureType = "NTC Transcoded to BCn";
-                    else
-                        textureType = "NTC Decompressed on Load";
-                    break;
-                case NtcMode::InferenceOnFeedback:
-                    textureType = "NTC Inference on Feedback";
-                    break;
-            }
-
-            ImGui::TextUnformatted(textureType);
-            
             size_t textureMemorySize = 0;
             if (g_options.referenceMaterials)
             {
+                textureType = "Reference Textures (PNGs etc.)";
                 textureMemorySize = m_referenceTextureMemorySize;
             }
             else
@@ -1004,16 +984,24 @@ public:
                 switch (m_ntcMode)
                 {
                 case NtcMode::InferenceOnSample:
+                    textureType = "NTC Inference on Sample";
                     textureMemorySize = m_ntcTextureMemorySize;
                     break;
                 case NtcMode::InferenceOnLoad:
+                    if (g_options.blockCompression)
+                        textureType = "NTC Transcoded to BCn";
+                    else
+                        textureType = "NTC Decompressed on Load";
                     textureMemorySize += m_transcodedTextureMemorySize;
                     break;
                 case NtcMode::InferenceOnFeedback:
+                    textureType = "NTC Inference on Feedback";
                     textureMemorySize = size_t(m_feedbackManager->GetStats().heapAllocationInBytes) + m_ntcTextureMemorySize;
                     break;
                 }
             }
+
+            ImGui::TextUnformatted(textureType);
             ImGui::Text("Texture Memory: %.2f MB", float(textureMemorySize) / 1048576.f);
             
             auto renderTime = m_renderPassTimer.getAverageTime();
@@ -1164,7 +1152,8 @@ public:
                 constexpr double megabyte = 1'048'576;
                 double tilesTotalMb = double(uint64_t(stats.tilesTotal) * tileSizeInBytes) / megabyte;
                 ImGui::Text("Tiles Total: %d (%.0f MB)", stats.tilesTotal, tilesTotalMb);
-                ImGui::Text("Tiles Allocated: %d (%.0f MB)", stats.tilesAllocated, double(uint64_t(stats.tilesAllocated) * tileSizeInBytes) / megabyte);
+                ImGui::Text("Tiles Allocated: %d (%.0f MB)", stats.tilesAllocated, double(uint64_t(stats.tilesAllocated)* tileSizeInBytes) / megabyte);
+                ImGui::Text("Tiles Standby: %d (%.0f MB)", stats.tilesStandby, double(uint64_t(stats.tilesStandby) * tileSizeInBytes) / megabyte);
                 double tilesHeapAllocatedMb = double(stats.heapAllocationInBytes) / megabyte;
                 ImGui::Text("Heap Allocation: %.0f MB", tilesHeapAllocatedMb);
                 double ntcMemoryMb = double(m_ntcTextureMemorySize) / megabyte;

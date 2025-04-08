@@ -53,7 +53,7 @@ public:
         bool enableInferenceOnLoad, bool enableBlockCompression, bool enableInferenceOnSample,
         bool enableInferenceOnFeedback, std::shared_ptr<nvfeedback::FeedbackManager> feedbackManager);
 
-    bool TranscodeTile(const NtcMaterial& material, const nvfeedback::FeedbackTextureTile& tile, nvrhi::ICommandList* commandList,
+    bool TranscodeTile(const NtcMaterial& material, const nvfeedback::FeedbackTextureTileInfo& tile, nvrhi::ICommandList* commandList,
         bool onlyAlphaMask, bool enableBlockCompression);
 
 private:

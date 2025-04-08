@@ -15,7 +15,7 @@
 #include <nvrhi/nvrhi.h>
 
 #include "../include/FeedbackManager.h"
-#include "rtxts-ttm/tiledTextureManager.h"
+#include "rtxts-ttm/TiledTextureManager.h"
 
 #include <vector>
 #include <atomic>
@@ -58,6 +58,8 @@ namespace nvfeedback
         nvrhi::TextureHandle GetReservedTexture() override;
         nvrhi::SamplerFeedbackTextureHandle GetSamplerFeedbackTexture() override;
         nvrhi::TextureHandle GetMinMipTexture() override;
+        bool IsTilePacked(uint32_t tileIndex) override;
+        void GetTileInfo(uint32_t tileIndex, std::vector<FeedbackTextureTileInfo>& tiles) override;
 
         // Internal methods
         FeedbackTextureImpl(const nvrhi::TextureDesc& desc, FeedbackManagerImpl* pFeedbackManager, rtxts::TiledTextureManager* tiledTextureManager, nvrhi::IDevice* device, uint32_t numReadbacks);

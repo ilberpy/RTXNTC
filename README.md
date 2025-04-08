@@ -1,4 +1,4 @@
-# Neural Texture Compression (NTC) SDK v0.6.0 BETA
+# Neural Texture Compression (NTC) SDK v0.6.1 BETA
 
 [Quick Start Guide](#quick-start-guide)
 
