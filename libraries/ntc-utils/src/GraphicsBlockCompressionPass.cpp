@@ -46,7 +46,7 @@ bool GraphicsBlockCompressionPass::ExecuteComputePass(nvrhi::ICommandList* comma
     auto& pipeline = m_pipelines[computePass.computeShader];
     if (!pipeline)
     {
-        nvrhi::ShaderHandle computeShader = m_device->createShader(nvrhi::ShaderDesc(nvrhi::ShaderType::Compute),
+        nvrhi::ShaderHandle computeShader = m_device->createShader(nvrhi::ShaderDesc().setShaderType(nvrhi::ShaderType::Compute),
             computePass.computeShader, computePass.computeShaderSize);
 
         nvrhi::ComputePipelineDesc pipelineDesc;
@@ -77,7 +77,6 @@ bool GraphicsBlockCompressionPass::ExecuteComputePass(nvrhi::ICommandList* comma
             return false;
     }
 
-    // Create the binding set
     nvrhi::BindingSetDesc bindingSetDesc;
     bindingSetDesc
         .addItem(nvrhi::BindingSetItem::ConstantBuffer(0, m_constantBuffer))
@@ -89,8 +88,7 @@ bool GraphicsBlockCompressionPass::ExecuteComputePass(nvrhi::ICommandList* comma
     if (accelerationBuffer)
         bindingSetDesc.addItem(nvrhi::BindingSetItem::RawBuffer_UAV(3, accelerationBuffer));
 
-    auto bindingSet = m_device->createBindingSet(bindingSetDesc, m_bindingLayout);
-
+    nvrhi::BindingSetHandle bindingSet = m_bindingCache.GetOrCreateBindingSet(bindingSetDesc, m_bindingLayout);
     if (!bindingSet)
         return false;
 

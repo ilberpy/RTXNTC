@@ -15,6 +15,7 @@
 #include <nvrhi/nvrhi.h>
 #include <libntc/ntc.h>
 #include <unordered_map>
+#include <donut/engine/BindingCache.h>
 
 class GraphicsBlockCompressionPass
 {
@@ -23,6 +24,7 @@ public:
         : m_device(device)
         , m_useAccelerationBuffer(useAccelerationBuffer)
         , m_maxConstantBufferVersions(maxConstantBufferVersions)
+        , m_bindingCache(device)
     { }
 
     bool Init();
@@ -33,10 +35,13 @@ public:
         nvrhi::ITexture* inputTexture, nvrhi::Format inputFormat, int inputMipLevel,
         nvrhi::ITexture* outputTexture, int outputMipLevel, nvrhi::IBuffer* accelerationBuffer);
 
+    void ClearBindingSetCache() { m_bindingCache.Clear(); }
+
 private:
     nvrhi::DeviceHandle m_device;
     std::unordered_map<const void*, nvrhi::ComputePipelineHandle> m_pipelines; // shader bytecode -> pipeline
     nvrhi::BindingLayoutHandle m_bindingLayout;
+    donut::engine::BindingCache m_bindingCache;
     nvrhi::BufferHandle m_constantBuffer;
     bool m_useAccelerationBuffer;
     int m_maxConstantBufferVersions;

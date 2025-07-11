@@ -1,4 +1,20 @@
-# RTXNTC Change Log
+# RTX Neural Texture Compression SDK Change Log
+
+## 0.7.0 BETA
+
+### LibNTC
+
+- Switched the DX12 Cooperative Vector implementation to use the Agility SDK Preview instead of the NVIDIA custom extensions.
+- Moved the Cooperative Vector weight layout conversions to happen on the GPU.
+- Added support for shuffling inference output channels to make channel mappings more flexible.
+- Improved code quality around inference weight layouts.
+
+### Rendering Sample
+
+- Implemented a custom GLTF extension `NV_texture_swizzle` to define the NTC storage for materials.
+- Improved the Inference on Feedback mode to transcode tiles in batches.
+- Improved the Inference on Sample mode by replacing conditional texture channel usage with constant output channels.
+- Added a display of the inference math versions that are being used for materials.
 
 ## 0.6.1 BETA
 

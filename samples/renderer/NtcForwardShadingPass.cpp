@@ -20,9 +20,7 @@
 #include <libntc/ntc.h>
 
 #if NTC_WITH_DX12
-    #if NTC_WITH_COOPVEC
-        #include "compiled_shaders/NtcForwardShadingPass_CoopVec.dxil.h"
-    #endif
+    #include "compiled_shaders/NtcForwardShadingPass_CoopVec.dxil.h"
     #include "compiled_shaders/NtcForwardShadingPass.dxil.h"
     #include "compiled_shaders/LegacyForwardShadingPass.dxil.h"
     #include "compiled_shaders/ForwardShadingPassFeedback.dxil.h"
@@ -31,9 +29,7 @@
 #endif
 
 #if NTC_WITH_VULKAN
-    #if NTC_WITH_COOPVEC
-        #include "compiled_shaders/NtcForwardShadingPass_CoopVec.spirv.h"
-    #endif
+    #include "compiled_shaders/NtcForwardShadingPass_CoopVec.spirv.h"
     #include "compiled_shaders/NtcForwardShadingPass.spirv.h"
     #include "compiled_shaders/LegacyForwardShadingPass.spirv.h"
     // Comes from Donut, same as forward_vs_buffer_loads.dxil.h above
@@ -91,11 +87,9 @@ nvrhi::ShaderHandle NtcForwardShadingPass::GetOrCreatePixelShader(PipelineKey ke
 
             if (useCoopVec)
             {
-#if NTC_WITH_COOPVEC
                 pixelShader = m_shaderFactory->CreateStaticPlatformShader(
                     DONUT_MAKE_PLATFORM_SHADER(g_NtcForwardShadingPass_CoopVec),
                     &defines, nvrhi::ShaderType::Pixel);
-#endif
             }
             else
             {
@@ -333,8 +327,9 @@ std::shared_ptr<donut::engine::MaterialBindingCache> NtcForwardShadingPass::Crea
 
 bool NtcForwardShadingPass::Init()
 {
-    nvrhi::ShaderDesc vertexShaderDesc(nvrhi::ShaderType::Vertex);
-    vertexShaderDesc.entryName = "buffer_loads";
+    auto vertexShaderDesc = nvrhi::ShaderDesc()
+        .setShaderType(nvrhi::ShaderType::Vertex)
+        .setEntryName("buffer_loads");
 
     m_vertexShader = m_shaderFactory->CreateStaticPlatformShader(DONUT_MAKE_PLATFORM_SHADER(g_forward_vs_buffer_loads),
         nullptr, vertexShaderDesc);

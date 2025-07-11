@@ -163,7 +163,7 @@ bool ProcessCommandLine(int argc, const char** argv)
 
     if (g_options.scenePath.empty())
     {
-        char const* defaultModelRelativePath = "assets/models/FlightHelmet/FlightHelmet.gltf";
+        char const* defaultModelRelativePath = "assets/models/FlightHelmet/FlightHelmet.ntc.gltf";
         fs::path sdkRoot = app::GetDirectoryWithExecutable().parent_path().parent_path();
         fs::path defaultModel = sdkRoot / defaultModelRelativePath;
 
@@ -244,6 +244,7 @@ struct RequestedTile
     nvfeedback::FeedbackTexture* texture;
     uint32_t tileIndex;
 };
+const uint32_t g_feedbackCameraCutFramesInit = 10;
 
 class NtcSceneRenderer : public app::ImGui_Renderer
 {
@@ -267,6 +268,7 @@ private:
     AveragingTimerQuery m_prePassTimer;
     AveragingTimerQuery m_renderPassTimer;
     std::unique_ptr<NtcMaterialLoader> m_materialLoader;
+    std::string m_weightTypes;
 #if NTC_WITH_DLSS
     std::unique_ptr<DLSS> m_DLSS;
 #endif
@@ -276,6 +278,7 @@ private:
     std::unordered_map<nvfeedback::FeedbackTexture*, donut::engine::LoadedTexture*> m_loadedTexturesByFeedback;
     std::unordered_map<nvfeedback::FeedbackTexture*, NtcMaterial*> m_materialsByFeedback;
     std::queue<RequestedTile> m_requestedTiles;
+    uint32_t m_feedbackCameraCutFrames = 0;
 
     app::SwitchableCamera m_camera;
     engine::PlanarView m_view;
@@ -329,9 +332,10 @@ public:
         if (g_options.inferenceOnFeedback)
         {
             nvfeedback::FeedbackManagerDesc fmDesc = {};
-            fmDesc.heapSizeInTiles = 100;
+            fmDesc.heapSizeInTiles = 128;
             fmDesc.numFramesInFlight = GetDeviceManager()->GetBackBufferCount();
-            m_feedbackManager = std::shared_ptr<nvfeedback::FeedbackManager>(nvfeedback::CreateFeedbackManager(GetDevice(), fmDesc));
+            m_feedbackManager = std::shared_ptr<nvfeedback::FeedbackManager>(
+                nvfeedback::CreateFeedbackManager(GetDevice(), fmDesc));
         }
 #endif
     }
@@ -339,6 +343,74 @@ public:
     ~NtcSceneRenderer()
     {
         m_scene.reset();
+    }
+
+    // Returns names representing the math versions in the forward shading pass corresponding to each weight type.
+    static char const* WeightTypeToMathString(ntc::InferenceWeightType weightType)
+    {
+        switch(weightType)
+        {
+        case ntc::InferenceWeightType::GenericInt8:
+            return "DP4a";
+        case ntc::InferenceWeightType::CoopVecInt8:
+            return "INT8 (CoopVec)";
+        case ntc::InferenceWeightType::CoopVecFP8:
+            return "FP8 (CoopVec)";
+        default:
+            static char string[16];
+            snprintf(string, sizeof(string), "%d", int(weightType));
+            return string;
+        }
+    }
+
+    static std::string FormatWeightTypesText(WeightTypeHistogram const& histogram)
+    {
+        // Find out if the histogram only has one nonzero element. In this case, output it without the count.
+        // Ignore the "Unknown" values.
+        ntc::InferenceWeightType singleOption = ntc::InferenceWeightType::Unknown;
+        int optionCount = 0;
+        int knownOptionSum = 0;
+        for (size_t type = size_t(ntc::InferenceWeightType::GenericInt8);
+            type < size_t(ntc::InferenceWeightType::Count);
+            ++type)
+        {
+            int count = histogram[type];
+            if (count > 0)
+            {
+                singleOption = ntc::InferenceWeightType(type);
+                ++optionCount;
+                knownOptionSum += count;
+            }
+        }
+
+        if (optionCount == 0)
+            return "No NTC materials detected";
+        
+        std::stringstream ss;
+        if (optionCount == 1)
+        {
+            // If there is only one option, output it directly.
+            ss << "Math Version: " << WeightTypeToMathString(singleOption);
+        }
+        else
+        {
+            // If there are multiple options, format them as a newline-separated list with percentages.
+            assert(knownOptionSum > 0);
+            ss << "Math Version Per Material:";
+            for (size_t type = size_t(ntc::InferenceWeightType::GenericInt8);
+                type < size_t(ntc::InferenceWeightType::Count);
+                ++type)
+            {
+                int count = histogram[type];
+                if (count > 0)
+                {
+                    double percentage = 100.0 * count / knownOptionSum;
+                    ss << "\n  - " << WeightTypeToMathString(ntc::InferenceWeightType(type)) 
+                        << " (" << std::fixed << std::setprecision(1) << percentage << "%)";
+                }
+            }
+        }
+        return ss.str();
     }
 
     bool LoadScene(std::shared_ptr<vfs::IFileSystem> fs, const std::filesystem::path& sceneFileName) 
@@ -354,10 +426,13 @@ public:
             fs::path const materialDir = g_options.materialDir ? fs::path(g_options.materialDir) : fs::path();
 
             if (!m_materialLoader->LoadMaterialsForScene(*m_scene, materialDir,
-                g_options.inferenceOnLoad, g_options.blockCompression, g_options.inferenceOnSample, g_options.inferenceOnFeedback, m_feedbackManager))
+                g_options.inferenceOnLoad, g_options.blockCompression, g_options.inferenceOnSample,
+                g_options.inferenceOnFeedback, m_feedbackManager))
             {
                 return false;
             }
+
+            m_weightTypes = FormatWeightTypesText(m_materialLoader->GetWeightTypeHistogram());
         }
 
         m_scene->FinishedLoading(GetFrameIndex());
@@ -373,7 +448,8 @@ public:
         {
             for (auto it = m_textureCache->begin(); it != m_textureCache->end(); ++it)
             {
-                m_referenceTextureMemorySize += GetDevice()->getTextureMemoryRequirements(it->second->texture).size;
+                if (it->second->texture)
+                    m_referenceTextureMemorySize += GetDevice()->getTextureMemoryRequirements(it->second->texture).size;
             }
         }
         else
@@ -419,6 +495,8 @@ public:
                 add_material(materialPtr, ntcMaterial.transmissionTextureFeedback);
                 add_material(materialPtr, ntcMaterial.opacityTextureFeedback);
             }
+            // Trigger camera cut
+            m_feedbackCameraCutFrames = g_feedbackCameraCutFramesInit;
         }
 
         auto const& sceneCameras = m_scene->GetSceneGraph()->GetCameras();
@@ -718,17 +796,27 @@ public:
             
             m_commandList->open();
 
-            // Use 10% of the total number of managed tiles as the max number of standby tiles
+            // Use 10% of the total number of managed tiles as the target number of extra standby tiles
             nvfeedback::FeedbackManagerStats statsLastFrame = m_feedbackManager->GetStats();
             uint32_t standByTileCount = statsLastFrame.tilesTotal / 10;
+
+            // Map and transcode only numTilesMax tiles per frame to reduce frametime spikes
+            uint32_t numTilesMax = MAX_TILES_PER_FRAME;
 
             nvfeedback::FeedbackUpdateConfig fconfig = {};
             fconfig.frameIndex = GetDeviceManager()->GetCurrentBackBufferIndex();
             fconfig.maxTexturesToUpdate = 10;
-            fconfig.tileTimeoutSeconds = 2;
-            fconfig.defragmentHeaps = true;
-            fconfig.releaseEmptyHeaps = true;
-            fconfig.maxStandbyTiles = standByTileCount;
+            fconfig.tileTimeoutSeconds = 1.0f;
+            fconfig.defragmentHeaps = false;
+            fconfig.releaseEmptyHeaps = false;
+            fconfig.numExtraStandbyTiles = standByTileCount;
+            if (m_feedbackCameraCutFrames > 0)
+            {
+                // For a "camera cut" (or first frame or toggling feedback mode) we update and transcode more for a few frames
+                fconfig.maxTexturesToUpdate = 0;
+                numTilesMax = 256;
+                m_feedbackCameraCutFrames--;
+            }
             nvfeedback::FeedbackTextureCollection updatedTextures = {};
             m_feedbackManager->BeginFrame(m_commandList, fconfig, &updatedTextures);
 
@@ -782,8 +870,6 @@ public:
                         pTexUpdate->tileIndices.push_back(reqTile.tileIndex);
                     };
 
-                // Map and transcode only numTilesMax tiles per frame to reduce frametime spikes
-                uint32_t numTilesMax = 64;
                 uint32_t countThisFrame = std::min((uint32_t)m_requestedTiles.size(), numTilesMax);
                 for (uint32_t i = 0; i < countThisFrame; i++)
                 {
@@ -840,6 +926,7 @@ public:
             // Phase 3: Decode NTC texture tiles
 
             m_commandList->open();
+            std::vector<TranscodeTileInfo> tiles;
             for (auto& pair : materialsAndTiles)
             {
                 NtcMaterial* ntcmaterial = pair.first;
@@ -847,9 +934,14 @@ public:
 
                 for (auto& tile : tileset)
                 {
-                    // Now decode the tile
-                    m_materialLoader->TranscodeTile(*ntcmaterial, tile, m_commandList, false, g_options.blockCompression);
+                    tiles.push_back({ ntcmaterial, tile });
                 }
+            }
+
+            for (size_t i = 0; i < tiles.size(); i += TRANSCODE_BATCH_SIZE)
+            {
+                auto batch = std::vector<TranscodeTileInfo>(tiles.begin() + i, tiles.begin() + std::min(i + TRANSCODE_BATCH_SIZE, tiles.size()));
+                m_materialLoader->TranscodeTiles(batch, m_commandList, g_options.blockCompression);
             }
 
             m_commandList->close();
@@ -1009,6 +1101,10 @@ public:
             {
                 ImGui::Text("Forward Pass Time: %.2f ms", renderTime.value() * 1e3f);
             }
+            if (!g_options.referenceMaterials)
+            {
+                ImGui::TextUnformatted(m_weightTypes.c_str());
+            }
 
             ImGui::PopFont();
             
@@ -1031,9 +1127,6 @@ public:
 
             ImGui::Text("GPU: %s", GetDeviceManager()->GetRendererString());
 
-            ImGui::Text("CoopVec Support: Int8 (%s), FP8 (%s)",
-                BoolToUIString(m_materialLoader->IsCooperativeVectorInt8Supported()),
-                BoolToUIString(m_materialLoader->IsCooperativeVectorFP8Supported()));
 
             ImGui::Separator();
 
@@ -1054,7 +1147,11 @@ public:
                 for (auto const& camera : m_scene->GetSceneGraph()->GetCameras())
                 {
                     if (ImGui::Selectable(camera->GetName().c_str(), camera == m_camera.GetSceneCamera()))
+                    {
                         m_camera.SwitchToSceneCamera(camera);
+                        // Trigger camera cut
+                        m_feedbackCameraCutFrames = g_feedbackCameraCutFramesInit;
+                    }
                 }
                 ImGui::EndCombo();
             }
@@ -1084,6 +1181,8 @@ public:
                 if (ImGui::RadioButton("Feedback", m_ntcMode == NtcMode::InferenceOnFeedback))
                 {
                     m_ntcMode = NtcMode::InferenceOnFeedback;
+                    // Trigger camera cut
+                    m_feedbackCameraCutFrames = g_feedbackCameraCutFramesInit;
                 }
                 ImGui::EndDisabled();
 

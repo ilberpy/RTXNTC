@@ -64,6 +64,7 @@ set(libntc_include_directory "${CMAKE_SOURCE_DIR}/libraries/RTXNTC-Library/inclu
 
 donut_compile_shaders_all_platforms(
     TARGET ntc-explorer-shaders
+    PROJECT_NAME "NTC Explorer"
     CONFIG ${CMAKE_CURRENT_SOURCE_DIR}/Shaders.cfg
     OUTPUT_BASE ${shader_output_dir}
     OUTPUT_FORMAT HEADER

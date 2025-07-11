@@ -1,6 +1,0 @@
-HoseMat.ntc
-HoseMat.ntc
-GlassPlasticMat.ntc
-MetalPartsMat.ntc
-LeatherPartsMat.ntc
-LensesMat.ntc

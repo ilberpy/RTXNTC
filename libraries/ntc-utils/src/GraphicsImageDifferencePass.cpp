@@ -74,7 +74,7 @@ bool GraphicsImageDifferencePass::ExecuteComputePass(nvrhi::ICommandList* comman
     auto& pipeline = m_pipelines[computePass.computeShader];
     if (!pipeline)
     {
-        nvrhi::ShaderHandle computeShader = m_device->createShader(nvrhi::ShaderDesc(nvrhi::ShaderType::Compute),
+        nvrhi::ShaderHandle computeShader = m_device->createShader(nvrhi::ShaderDesc().setShaderType(nvrhi::ShaderType::Compute),
             computePass.computeShader, computePass.computeShaderSize);
 
         nvrhi::ComputePipelineDesc pipelineDesc;

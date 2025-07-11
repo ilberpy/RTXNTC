@@ -66,8 +66,8 @@ Note that `LatentShape` doesn't specify the `gridSizeScale` parameter, as it is 
 - `layers`: ordered array of object `MLPLayer`, required to be non-empty.
 - `activation`: `ActivationType`, optional(`HGELUClamp`), curerntly only `HGELUClamp` is supported, applied to all layers except the last one
 - `weightLayout`: `MatrixLayout`, optional(`ColumnMajor`), currently only `ColumnMajor` is supported
-- `weightType`: `MlpDataType`, required, currently `Int8` and `FloatE4M3` are supported - note that layers may override the type
-- `scaleBiasType`: `MlpDataType`, required, currently `Float16` and `Float32` are supported - note that layers may override the type
+- `weightType`: `MlpDataType`, deprecated.
+- `scaleBiasType`: `MlpDataType`, deprecated.
 
 ### `MLPLayer` object
 
@@ -76,8 +76,10 @@ Note that `LatentShape` doesn't specify the `gridSizeScale` parameter, as it is 
 - `weightView`: int, required, index of the `BufferView` with the weight data
 - `scaleView`: int, optional, index of the `BufferView` with the scale data - when there is no view, all scales are assumed to be 1.0
 - `biasView`: int, required, index of the `BufferView` with the bias data
-- `weightType`: `MlpDataType`, optional, overrides the type specified in the `MLP` for this layer
-- `scaleBiasType`: `MlpDataType`, optional, overrides the type specified in the `MLP` for this layer
+- `weightType`: `MlpDataType`, required, data type of the weights, currently `Int8` and `FloatE4M3` are supported.
+- `scaleBiasType`: `MlpDataType`, deprecated.
+- `scaleType`: `MlpDataType`, optional, data type of the scale values, currently only `Float32` is supported.
+- `biasType`: `MlpDataType`, optional, data type of the bias values, currently `Float32`, `Int32` and `Float16` are supported.
 
 ### `Texture` object
 
@@ -93,8 +95,6 @@ Note that `LatentShape` doesn't specify the `gridSizeScale` parameter, as it is 
 
 ### `Channel` object
 
-- `scale`: float, required, scaling that needs to be applied to inference output to get color
-- `bias`: float, required, bias that needs to be applied to inference output after scaling to get color
 - `colorSpace`: `ColorSpace`, optional(`Linear`), color space in which the data is encoded after applying scale and bias
 
 ### `LatentImage` object

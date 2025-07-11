@@ -10,19 +10,20 @@
  * its affiliates is strictly prohibited.
  */
 
+#if NTC_WITH_DX12
+#include <directx/d3d12.h>
+extern "C"
+{
+    _declspec(dllexport) extern const unsigned int D3D12SDKVersion = D3D12_PREVIEW_SDK_VERSION;
+    _declspec(dllexport) extern const char* D3D12SDKPath = ".\\d3d12\\";
+}
+#endif
+
 #include <ntc-utils/DeviceUtils.h>
 
 #include <libntc/ntc.h>
 #include <donut/app/DeviceManager.h>
 #include <donut/core/log.h>
-
-#if NTC_WITH_DX12
-extern "C"
-{
-    _declspec(dllexport) extern const uint32_t D3D12SDKVersion = DONUT_D3D_AGILITY_SDK_VERSION;
-    _declspec(dllexport) extern const char* D3D12SDKPath = ".\\d3d12\\";
-}
-#endif
 
 #if NTC_WITH_DX12
 static bool g_dx12DeveloperModeEnabled = false;
@@ -217,7 +218,7 @@ void SetNtcGraphicsDeviceParameters(
     g_dx12DeveloperModeEnabled = false;
     if (graphicsApi == nvrhi::GraphicsAPI::D3D12)
     {
-        UUID Features[] = { D3D12ExperimentalShaderModels };
+        UUID Features[] = { D3D12ExperimentalShaderModels, D3D12CooperativeVectorExperiment };
         HRESULT hr = D3D12EnableExperimentalFeatures(_countof(Features), Features, nullptr, nullptr);
 
         if (FAILED(hr))

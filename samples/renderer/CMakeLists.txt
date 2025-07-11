@@ -21,6 +21,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 add_executable(ntc-renderer WIN32)
 
 target_sources(ntc-renderer PRIVATE
+    NtcChannelMapping.h
     NtcMaterial.h
     NtcMaterialLoader.cpp
     NtcMaterialLoader.h
@@ -37,9 +38,9 @@ file(GLOB feedback_sources
     feedbackmanager/include/*.h
     feedbackmanager/src/*.h
     feedbackmanager/src/*.cpp
-    ../../external/RTXTS-TTM/include/rtxts-ttm/*.h
-    ../../external/RTXTS-TTM/src/*.h
-    ../../external/RTXTS-TTM/src/*.cpp
+    ../../libraries/RTXTS-TTM/include/rtxts-ttm/*.h
+    ../../libraries/RTXTS-TTM/src/*.h
+    ../../libraries/RTXTS-TTM/src/*.cpp
 )
 
 if (DONUT_WITH_DX12)
@@ -104,7 +105,7 @@ set(libstf_include_directory "${CMAKE_SOURCE_DIR}/libraries/RTXTF-Library")
 target_include_directories(ntc-renderer PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
 target_include_directories(ntc-renderer PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/../../external/donut/shaders")
 target_include_directories(ntc-renderer PRIVATE "${libstf_include_directory}")
-target_include_directories(ntc-renderer PRIVATE "${CMAKE_SOURCE_DIR}/external/RTXTS-TTM/include")
+target_include_directories(ntc-renderer PRIVATE "${CMAKE_SOURCE_DIR}/libraries/RTXTS-TTM/include")
 
 add_custom_target(ntc-renderer-shaders
     DEPENDS ShaderMake
@@ -114,6 +115,7 @@ set_source_files_properties(${shader_sources} PROPERTIES VS_TOOL_OVERRIDE "None"
 
 donut_compile_shaders_all_platforms(
     TARGET ntc-renderer-shaders
+    PROJECT_NAME "NTC Renderer"
     CONFIG ${CMAKE_CURRENT_SOURCE_DIR}/Shaders.cfg
     SOURCES ${shader_sources}
     BYPRODUCTS_NO_EXT ${shader_outputs}
@@ -121,27 +123,24 @@ donut_compile_shaders_all_platforms(
     OUTPUT_BASE ${shader_output_dir}
     INCLUDES ${libntc_include_directory} ${libstf_include_directory}
     SHADERMAKE_OPTIONS "--hlsl2021"
-    SHADERMAKE_OPTIONS_DXIL "--shaderModel 6_6"
+    SHADERMAKE_OPTIONS_DXIL "--shaderModel 6_5"
     SHADERMAKE_OPTIONS_SPIRV "--vulkanVersion 1.2"
 )
 
-if (NTC_WITH_COOPVEC)
-    set(SLANGC_PATH "${SLANG_COMPILER}")
-
-    donut_compile_shaders_all_platforms(
-        TARGET ntc-renderer-shaders
-        CONFIG ${CMAKE_CURRENT_SOURCE_DIR}/SlangShaders.cfg
-        SLANG
-        SOURCES ${shader_sources}
-        BYPRODUCTS_NO_EXT ${shader_outputs_slang}
-        OUTPUT_FORMAT HEADER
-        OUTPUT_BASE ${shader_output_dir}
-        INCLUDES ${libntc_include_directory} ${libstf_include_directory}
-        # Disable errorneous 'use of uninitialized variable' warnings
-        SHADERMAKE_OPTIONS_DXIL "--shaderModel 6_8 -X -Wno-41016"
-        # Disable errorneous 'use of uninitialized global variable' warnings
-        SHADERMAKE_OPTIONS_SPIRV "-X \"-Wno-41017 -capability spvCooperativeVectorNV\""
-    )
-endif()
+donut_compile_shaders_all_platforms(
+    TARGET ntc-renderer-shaders
+    PROJECT_NAME "NTC Renderer"
+    CONFIG ${CMAKE_CURRENT_SOURCE_DIR}/SlangShaders.cfg
+    SLANG
+    SOURCES ${shader_sources}
+    BYPRODUCTS_NO_EXT ${shader_outputs_slang}
+    OUTPUT_FORMAT HEADER
+    OUTPUT_BASE ${shader_output_dir}
+    INCLUDES ${libntc_include_directory} ${libstf_include_directory}
+    # Disable errorneous 'use of uninitialized variable' warnings
+    SHADERMAKE_OPTIONS_DXIL "--shaderModel 6_9 -X -Wno-41016 -X -Wno-41012 -X -Xdxc -X -Vd"
+    # Disable errorneous 'use of uninitialized global variable' warnings
+    SHADERMAKE_OPTIONS_SPIRV "-X \"-Wno-41017 -capability spvCooperativeVectorNV\""
+)
 
 add_dependencies(ntc-renderer ntc-renderer-shaders)

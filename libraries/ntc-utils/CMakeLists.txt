@@ -64,8 +64,7 @@ target_link_libraries(ntc-utils PUBLIC libntc donut_app)
 
 target_compile_definitions(ntc-utils PUBLIC
     NTC_WITH_DX12=$<BOOL:${DONUT_WITH_DX12}>
-    NTC_WITH_VULKAN=$<BOOL:${DONUT_WITH_VULKAN}>
-    NTC_WITH_COOPVEC=$<BOOL:${NTC_WITH_COOPVEC}>)
+    NTC_WITH_VULKAN=$<BOOL:${DONUT_WITH_VULKAN}>)
 
 if (WIN32)
     target_compile_definitions(ntc-utils PRIVATE

@@ -17,6 +17,32 @@
 
 #include "feedbackmanager/include/FeedbackManager.h"
 
+struct NtcMaterial;
+
+struct TextureTranscodeTask
+{
+    ntc::ITextureMetadata const* metadata = nullptr;
+    ntc::BlockCompressedFormat bcFormat = ntc::BlockCompressedFormat::None;
+    nvrhi::TextureHandle color;
+    nvrhi::TextureHandle blocks;
+    nvrhi::TextureHandle compressed;
+    nvrhi::Format nvrhiBcFormat = nvrhi::Format::UNKNOWN;
+    int firstChannel = 0;
+    int numChannels = 0;
+    int mipZeroDescriptor = 0;
+    bool sRGB = false;
+    char const* name = nullptr;
+    std::shared_ptr<donut::engine::LoadedTexture> NtcMaterial::* pMaterialTexture = nullptr;
+    nvrhi::RefCountPtr<nvfeedback::FeedbackTexture> NtcMaterial::* pFeedbackTexture = nullptr;
+
+    void ReleaseTextures()
+    {
+        color = nullptr;
+        blocks = nullptr;
+        compressed = nullptr;
+    }
+};
+
 struct NtcMaterial : public donut::engine::Material
 {
     nvrhi::BufferHandle ntcConstantBuffer;
@@ -35,9 +61,10 @@ struct NtcMaterial : public donut::engine::Material
     nvrhi::RefCountPtr<nvfeedback::FeedbackTexture> occlusionTextureFeedback;
     nvrhi::RefCountPtr<nvfeedback::FeedbackTexture> transmissionTextureFeedback;
     nvrhi::RefCountPtr<nvfeedback::FeedbackTexture> opacityTextureFeedback;
-    std::vector<nvfeedback::FeedbackTexture*> feedbackTextures;
 
     std::shared_ptr<ntc::TextureSetMetadataWrapper> textureSetMetadata;
+
+    std::vector<TextureTranscodeTask> transcodeMapping;
 };
 
 class NtcSceneTypeFactory : public donut::engine::SceneTypeFactory

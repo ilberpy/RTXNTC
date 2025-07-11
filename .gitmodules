@@ -13,6 +13,6 @@
 [submodule "libraries/RTXNTC-Library"]
 	path = libraries/RTXNTC-Library
 	url = ../RTXNTC-Library.git
-[submodule "external/RTXTS-TTM"]
-	path = external/RTXTS-TTM
+[submodule "libraries/RTXTS-TTM"]
+	path = libraries/RTXTS-TTM
 	url = ../RTXTS-TTM.git

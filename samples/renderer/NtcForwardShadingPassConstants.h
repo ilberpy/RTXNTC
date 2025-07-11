@@ -10,6 +10,9 @@
  * its affiliates is strictly prohibited.
  */
 
+ #ifndef NTC_FORWARD_SHADING_PASS_CONSTANTS_H
+ #define NTC_FORWARD_SHADING_PASS_CONSTANTS_H
+ 
 // in FORWARD_SPACE_MATERIAL
 #define FORWARD_BINDING_NTC_MATERIAL_CONSTANTS 4
 #define FORWARD_BINDING_NTC_LATENTS_BUFFER 0
@@ -31,3 +34,5 @@ struct NtcForwardShadingPassConstants
     uint frameIndex;
     uint stfFilterMode;
 };
+
+#endif // NTC_FORWARD_SHADING_PASS_CONSTANTS_H

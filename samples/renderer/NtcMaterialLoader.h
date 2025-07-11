@@ -23,11 +23,20 @@ struct NtcMaterial;
 class GraphicsDecompressionPass;
 class GraphicsBlockCompressionPass;
 
+#define MAX_TILES_PER_FRAME 32
+#define TRANSCODE_BATCH_SIZE 8
+
 namespace donut::engine
 {
     struct LoadedTexture;
     class Scene;
 }
+
+struct TranscodeTileInfo
+{
+    NtcMaterial* material;
+    nvfeedback::FeedbackTextureTileInfo tileInfo;
+};
 
 namespace ntc
 {
@@ -35,6 +44,13 @@ namespace ntc
     class IStream;
     class ITextureSetMetadata;
 }
+
+struct MaterialChannelMap
+{
+    std::array<ntc::ShuffleSource, NTC_MAX_CHANNELS> swizzle;
+};
+
+typedef std::array<int, size_t(ntc::InferenceWeightType::Count)> WeightTypeHistogram;
 
 class NtcMaterialLoader
 {
@@ -53,8 +69,10 @@ public:
         bool enableInferenceOnLoad, bool enableBlockCompression, bool enableInferenceOnSample,
         bool enableInferenceOnFeedback, std::shared_ptr<nvfeedback::FeedbackManager> feedbackManager);
 
-    bool TranscodeTile(const NtcMaterial& material, const nvfeedback::FeedbackTextureTileInfo& tile, nvrhi::ICommandList* commandList,
-        bool onlyAlphaMask, bool enableBlockCompression);
+    bool TranscodeTiles(const std::vector<TranscodeTileInfo>& tiles, nvrhi::ICommandList* commandList,
+        bool enableBlockCompression);
+
+    WeightTypeHistogram const& GetWeightTypeHistogram() const { return m_weightTypeHistogram; }
 
 private:
     nvrhi::DeviceHandle m_device;
@@ -64,26 +82,29 @@ private:
 
     bool m_coopVecInt8 = false;
     bool m_coopVecFP8 = false;
+    WeightTypeHistogram m_weightTypeHistogram;
 
     std::shared_ptr<donut::engine::LoadedTexture> m_dummyTexture;
 
     std::shared_ptr<GraphicsDecompressionPass> m_graphicsDecompressionPass;
     std::shared_ptr<GraphicsBlockCompressionPass> m_graphicsBlockCompressionPass;
 
+    nvrhi::BufferHandle m_weightUploadBuffer;
+
     // Textures for tile-based decompression and recompression
-    std::vector<nvrhi::TextureHandle> m_texTileColorR8;
-    std::vector<nvrhi::TextureHandle> m_texTileColorRGBA;
-    std::vector<nvrhi::TextureHandle> m_texTileColorSRGBA;
-    nvrhi::TextureHandle m_texTileBlocksRG;
-    nvrhi::TextureHandle m_texTileBlocksRGBA;
+    uint32_t m_texTileColorR8Offset = 0;
+    uint32_t m_texTileColorRGBAOffset = 0;
+    uint32_t m_texTileBlocksRGOffset = 0;
+    uint32_t m_texTileBlocksRGBAOffset = 0;
+    std::vector<nvrhi::TextureHandle> m_texTranscodeTiles;
 
     bool TranscodeMaterial(ntc::IStream* ntcFile,
         ntc::ITextureSetMetadata* textureSetMetadata, NtcMaterial& material, nvrhi::ICommandList* commandList,
-        bool enableBlockCompression, bool onlyAlphaMask);
+        bool enableBlockCompression);
 
     bool PrepareMaterialForInferenceOnSample(ntc::IStream* ntcFile,
         ntc::ITextureSetMetadata* textureSetMetadata, NtcMaterial& material, nvrhi::ICommandList* commandList);
 
     bool PrepareFeedbackMaterial(std::shared_ptr<nvfeedback::FeedbackManager> feedbackManager,
-        ntc::ITextureSetMetadata* textureSetMetadata, NtcMaterial& material, nvrhi::ICommandList* commandList, bool enableBlockCompression);
+        ntc::ITextureSetMetadata* textureSetMetadata, NtcMaterial& material, bool enableBlockCompression);
 };

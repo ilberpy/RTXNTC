@@ -25,18 +25,21 @@ if (ntcStatus != ntc::Status::Ok)
     // Handle the error.
 ```
 
-Once you have the texture set metadata object, use the `ITextureSetMetadata::GetStreamRangeForLatents(...)`, `ITextureSetMetadata::GetInferenceWeights(...)` and `IContext::MakeInferenceData(...)` methods to obtain the data needed to run inference in the shader. Note the `weightType` parameter; it indicates which version of inference function the application will use, which affects the layout of the weights. When the library determines that the graphics device supports CoopVec, the `MakeInferenceData` will be able to provide weights both for CoopVec decompression functions; when there is no such support, a call to `GetInferenceWeights` or `MakeInferenceData` with those weight types will return `Status::Unsupported`.
+Once you have the texture set metadata object, use the `ITextureSetMetadata::GetStreamRangeForLatents(...)`, `ITextureSetMetadata::GetInferenceWeights(...)`, `ITextureSetMetadata::ConvertInferenceWeights(...)` and `IContext::MakeInferenceData(...)` methods to obtain the data needed to run inference in the shader. Note the `weightType` parameter; it indicates which version of inference function the application will use, which affects the layout of the weights. When the library determines that the graphics device supports CoopVec, the `MakeInferenceData` will be able to provide weights both for CoopVec decompression functions; when there is no such support, a call to `GetInferenceWeights` or `MakeInferenceData` with those weight types will return `Status::Unsupported`.
 
 ```c++
 // Select the weight type that matches the version of the inference shader that's being used.
 auto const weightType = ntc::InferenceWeightType::GenericInt8;
 
-void const* pWeights = nullptr;
-size_t weightSize = 0;
-ntcStatus = metadata->GetInferenceWeights(weightType, &pWeights, &weightSize)
+void const* pWeightData = nullptr;
+size_t uploadSize = 0;
+size_t convertedSize = 0;
+ntcStatus = metadata->GetInferenceWeights(weightType, &pWeightData, &uploadSize, &convertedSize);
 
 if (ntcStatus != ntc::Status::Ok)
     // Handle the error.
+
+// ... Copy and convert the weights on the GPU - see the Inference on Load guide for a more complete example ...
 
 ntc::StreamRange streamRange;
 ntcStatus = metadata->GetStreamRangeForLatents(firstMip, numMips, streamRange);

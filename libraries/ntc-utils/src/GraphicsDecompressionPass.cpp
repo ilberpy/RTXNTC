@@ -92,7 +92,6 @@ bool GraphicsDecompressionPass::SetInputData(nvrhi::ICommandList* commandList, n
 
         m_inputBuffer = m_device->createBuffer(inputBufferDesc);
         m_inputBufferIsExternal = false;
-        m_bindingSet = nullptr;
 
         if (!m_inputBuffer)
             return false;
@@ -119,9 +118,100 @@ void GraphicsDecompressionPass::SetInputBuffer(nvrhi::IBuffer* buffer)
     
     m_inputBuffer = buffer;
     m_inputBufferIsExternal = true; // Prevent the buffer from being overwritten by a subsequent call to SetInputData
-    m_bindingSet = nullptr;
 }
 
+bool GraphicsDecompressionPass::SetWeightsFromTextureSet(nvrhi::ICommandList* commandList,
+    ntc::ITextureSetMetadata* textureSetMetadata, ntc::InferenceWeightType weightType)
+{
+    void const* uploadData = nullptr;
+    size_t uploadSize = 0;
+    size_t convertedSize = 0;
+    textureSetMetadata->GetInferenceWeights(weightType, &uploadData, &uploadSize, &convertedSize);
+
+    bool const uploadBufferNeeded = convertedSize != 0;
+
+    // Create the weight upload buffer if it doesn't exist yet or if it is too small
+    if (!m_weightUploadBuffer && uploadBufferNeeded ||
+        m_weightUploadBuffer && m_weightUploadBuffer->getDesc().byteSize < uploadSize)
+    {
+        nvrhi::BufferDesc uploadBufferDesc;
+        uploadBufferDesc
+            .setByteSize(uploadSize)
+            .setDebugName("DecompressionWeightsUpload")
+            .setInitialState(nvrhi::ResourceStates::CopyDest)
+            .setKeepInitialState(true);
+
+        m_weightUploadBuffer = m_device->createBuffer(uploadBufferDesc);
+
+        if (!m_weightUploadBuffer)
+            return false;
+    }
+
+    size_t finalWeightBufferSize = convertedSize ? convertedSize : uploadSize;
+
+    // Create the weight buffer if it doesn't exist yet or if it is too small
+    if (!m_weightBuffer || m_weightBufferIsExternal || m_weightBuffer->getDesc().byteSize < finalWeightBufferSize)
+    {
+        nvrhi::BufferDesc weightBufferDesc;
+        weightBufferDesc
+            .setByteSize(finalWeightBufferSize)
+            .setDebugName("DecompressionWeights")
+            .setCanHaveRawViews(true)
+            .setCanHaveUAVs(true)
+            .setInitialState(nvrhi::ResourceStates::ShaderResource)
+            .setKeepInitialState(true);
+
+        m_weightBuffer = m_device->createBuffer(weightBufferDesc);
+        m_weightBufferIsExternal = false;
+
+        if (!m_weightBuffer)
+            return false;
+    }
+
+    if (uploadBufferNeeded)
+    {
+        // Write the weight upload buffer
+        commandList->writeBuffer(m_weightUploadBuffer, uploadData, uploadSize);
+
+        // Place the barriers before layout conversion - which happens in LibNTC and bypasses NVRHI
+        commandList->setBufferState(m_weightUploadBuffer, nvrhi::ResourceStates::ShaderResource);
+        commandList->setBufferState(m_weightBuffer, nvrhi::ResourceStates::UnorderedAccess);
+        commandList->commitBarriers();
+
+        // Unwrap the command list and buffer objects from NVRHI
+        bool const isVulkan = m_device->getGraphicsAPI() == nvrhi::GraphicsAPI::VULKAN;
+        nvrhi::ObjectType const commandListType = isVulkan
+            ? nvrhi::ObjectTypes::VK_CommandBuffer
+            : nvrhi::ObjectTypes::D3D12_GraphicsCommandList;
+        nvrhi::ObjectType const bufferType = isVulkan
+            ? nvrhi::ObjectTypes::VK_Buffer
+            : nvrhi::ObjectTypes::D3D12_Resource;
+
+        void* nativeCommandList = commandList->getNativeObject(commandListType);
+        void* nativeSrcBuffer = m_weightUploadBuffer->getNativeObject(bufferType);
+        void* nativeDstBuffer = m_weightBuffer->getNativeObject(bufferType);
+
+        // Convert the weight layout to CoopVec
+        textureSetMetadata->ConvertInferenceWeights(weightType, nativeCommandList,
+            nativeSrcBuffer, 0, nativeDstBuffer, 0);
+    }
+    else
+    {
+        // Write the weight buffer directly
+        commandList->writeBuffer(m_weightBuffer, uploadData, uploadSize);
+    }
+
+    return true;
+}
+
+void GraphicsDecompressionPass::SetWeightBuffer(nvrhi::IBuffer* buffer)
+{
+    if (buffer == m_weightBuffer)
+        return;
+        
+    m_weightBuffer = buffer;
+    m_weightBufferIsExternal = true; // Prevent the buffer from being overwritten by a subsequent call to SetWeightsFromTextureSet
+}
 
 bool GraphicsDecompressionPass::ExecuteComputePass(nvrhi::ICommandList* commandList, ntc::ComputePassDesc& computePass)
 {
@@ -129,7 +219,7 @@ bool GraphicsDecompressionPass::ExecuteComputePass(nvrhi::ICommandList* commandL
     auto& pipeline = m_pipelines[computePass.computeShader];
     if (!pipeline)
     {
-        nvrhi::ShaderHandle computeShader = m_device->createShader(nvrhi::ShaderDesc(nvrhi::ShaderType::Compute),
+        nvrhi::ShaderHandle computeShader = m_device->createShader(nvrhi::ShaderDesc().setShaderType(nvrhi::ShaderType::Compute),
                                                                    computePass.computeShader,
                                                                    computePass.computeShaderSize);
 
@@ -157,55 +247,27 @@ bool GraphicsDecompressionPass::ExecuteComputePass(nvrhi::ICommandList* commandL
             .setMaxVersions(NTC_MAX_MIPS * NTC_MAX_CHANNELS);
 
         m_constantBuffer = m_device->createBuffer(constantBufferDesc);
-        m_bindingSet = nullptr;
 
         if (!m_constantBuffer)
             return false;
     }
 
-    // Create the weight buffer if it doesn't exist yet or if it is too small (which shouldn't happen currently)
-    if (!m_weightBuffer || m_weightBuffer->getDesc().byteSize < computePass.weightBufferSize)
-    {
-        nvrhi::BufferDesc weightBufferDesc;
-        weightBufferDesc
-            .setByteSize(computePass.weightBufferSize)
-            .setDebugName("DecompressionWeights")
-            .setCanHaveRawViews(true)
-            .setInitialState(nvrhi::ResourceStates::ShaderResource)
-            .setKeepInitialState(true);
-
-        m_weightBuffer = m_device->createBuffer(weightBufferDesc);
-        m_bindingSet = nullptr;
-
-        if (!m_weightBuffer)
-            return false;
-    }
-
-    // Create the binding set if it doesn't exist yet
-    if (!m_bindingSet)
-    {
-        nvrhi::BindingSetDesc bindingSetDesc;
-        bindingSetDesc
-            .addItem(nvrhi::BindingSetItem::ConstantBuffer(0, m_constantBuffer))
-            .addItem(nvrhi::BindingSetItem::RawBuffer_SRV(1, m_inputBuffer))
-            .addItem(nvrhi::BindingSetItem::RawBuffer_SRV(2, m_weightBuffer));
-
-        m_bindingSet = m_device->createBindingSet(bindingSetDesc, m_bindingLayout);
-
-        if (!m_bindingSet)
-            return false;
-    }
+    nvrhi::BindingSetDesc bindingSetDesc;
+    bindingSetDesc
+        .addItem(nvrhi::BindingSetItem::ConstantBuffer(0, m_constantBuffer))
+        .addItem(nvrhi::BindingSetItem::RawBuffer_SRV(1, m_inputBuffer))
+        .addItem(nvrhi::BindingSetItem::RawBuffer_SRV(2, m_weightBuffer));
+    nvrhi::BindingSetHandle bindingSet = m_bindingCache.GetOrCreateBindingSet(bindingSetDesc, m_bindingLayout);
+    if (!bindingSet)
+        return false;
 
     // Write the constant buffer
     commandList->writeBuffer(m_constantBuffer, computePass.constantBufferData, computePass.constantBufferSize);
 
-    // Write the weight buffer
-    commandList->writeBuffer(m_weightBuffer, computePass.weightBufferData, computePass.weightBufferSize);
-
     // Execute the compute shader for decompression
     nvrhi::ComputeState state;
     state.setPipeline(pipeline)
-         .addBindingSet(m_bindingSet)
+         .addBindingSet(bindingSet)
          .addBindingSet(m_descriptorTable);
     commandList->setComputeState(state);
     commandList->dispatch(computePass.dispatchWidth, computePass.dispatchHeight);

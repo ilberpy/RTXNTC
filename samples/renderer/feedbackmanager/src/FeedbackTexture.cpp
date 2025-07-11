@@ -107,6 +107,11 @@ namespace nvfeedback
 
     FeedbackTextureImpl::~FeedbackTextureImpl()
     {
+        std::vector<FeedbackTextureSetImpl*> textureSets = m_textureSets;
+        for (auto textureSet : textureSets)
+        {
+            RemoveFromTextureSet(textureSet);
+        }
         m_pFeedbackManager->UnregisterTexture(this);
     }
 
@@ -203,5 +208,67 @@ namespace nvfeedback
             tiles.push_back(tile);
         }
     }
+
+    uint32_t FeedbackTextureImpl::GetNumTextureSets() const
+    {
+        return (uint32_t)m_textureSets.size();
+    }
+
+    FeedbackTextureSet* FeedbackTextureImpl::GetTextureSet(uint32_t index) const
+    {
+        return m_textureSets[index];
+    }
     
+    bool FeedbackTextureImpl::AddToTextureSet(FeedbackTextureSetImpl* textureSet)
+    {
+        if (!textureSet)
+        {
+            return false;
+        }
+        auto it = std::find(m_textureSets.begin(), m_textureSets.end(), textureSet);
+        if (it == m_textureSets.end())
+        {
+            m_textureSets.push_back(textureSet);
+        }
+        UpdateTextureSets();
+        return true;
+    }
+    
+    bool FeedbackTextureImpl::RemoveFromTextureSet(FeedbackTextureSetImpl* textureSet)
+    {
+        if (!textureSet)
+        {
+            return false;
+        }
+        auto it = std::find(m_textureSets.begin(), m_textureSets.end(), textureSet);
+        if (it == m_textureSets.end())
+        {
+            return false;
+        }
+        m_textureSets.erase(it);
+        UpdateTextureSets();
+        return true;
+    }
+
+    void FeedbackTextureImpl::UpdateTextureSets()
+    {
+        // Figure out in which texture sets this texture is the primary texture for sampler feedback
+        m_primaryTextureSets.clear();
+        for (const auto& textureSet : m_textureSets)
+        {
+            if (textureSet->GetPrimaryTexture() == this)
+            {
+                m_primaryTextureSets.push_back(textureSet);
+            }
+        }
+
+        // Ensure this texture is in the ringbuffer, unless we use texture sets and are never a primary texture
+        bool needsRingBuffer = m_textureSets.size() == 0 || IsPrimaryTexture();
+        m_pFeedbackManager->UpdateTextureRingBufferState(this, needsRingBuffer);
+    }
+    
+    bool FeedbackTextureImpl::IsPrimaryTexture() const
+    {
+        return m_primaryTextureSets.size() > 0;
+    }
 }

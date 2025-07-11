@@ -1,4 +1,4 @@
-# Neural Texture Compression (NTC) SDK v0.6.1 BETA
+# RTX Neural Texture Compression (NTC) SDK v0.7.0 BETA
 
 [Quick Start Guide](#quick-start-guide)
 
@@ -48,12 +48,13 @@ See the [Settings and Quality Guide](docs/SettingsAndQuality.md) to learn more a
 
 Decompressing texels with NTC requires reading the latent data corresponding to a given texture coordinate and then performing an *inference* operation by running it through a small Multi-Layer Perceptron (MLP) network whose weights are determined during compression and stored as part of the compressed bundle. While this operation is modest relative to the massive networks employed by many other deep learning applications it still carries a significant computational cost relative to the average pixel shader commonly seen in 3D rendering applications. Fortunately, NTC is able to benefit from new [Cooporative Vector](https://registry.khronos.org/vulkan/specs/latest/man/html/VK_NV_cooperative_vector.html) extensions for Vulkan and Direct3D 12 which allow pixel shaders to leverage the same hardware acceleration used in large network inference. On Ada- and Blackwell-class GPUs this provides a 2-4x improvement in inference throughput over competing optimal implementations that do not utilize these new extensions.
 
-In order to provide robust backwards compatibility, fallback implementations of the inference code using the `dp4a` instructions have also been provided. This will allow for the decompression code to be executed reliably on any platform that supports at least Direct3D 12 Shader Model 6; however, there will be substantial performance improvements on newer GPUs. See [System Requirements](#system-requirements) for more details.
+In order to provide robust backwards compatibility, fallback implementations of the inference code using the `DP4a` instructions or regular integer math have also been provided. This will allow for the decompression code to be executed reliably on any platform that supports at least Direct3D 12 Shader Model 6; however, there will be substantial performance improvements on newer GPUs. See [System Requirements](#system-requirements) for more details.
 
-> ### WARNING: Pre-Release Feature Dependency
-> NTC texture decompression for graphics applications, both on-load and on-sample, uses an experimental implementation of Cooperative Vectors on DX12. This implementation relies on an [NVIDIA customized version of the DirectX Shader Compiler](https://github.com/NVIDIA-RTX/DirectXShaderCompiler/tree/CooperativeVector) (DXC) that produces code with new DXIL instructions. Shaders using these instructions cannot be signed, and Windows must be in the Developer Mode for them to work.
+> ### WARNING: Pre-Release Feature Dependency for Direct3D 12
+> NTC texture decompression for DX12 applications, both on-load and on-sample, relies on a preview version of the [Microsoft DirectX 12 Agility SDK](https://devblogs.microsoft.com/directx/directx12agility/), specifically, `1.717.x-preview`. In order for the [Cooperative Vector](https://devblogs.microsoft.com/directx/cooperative-vector/) extensions to work, the application must enable the `D3D12ExperimentalShaderModels` and `D3D12CooperativeVectorExperiment` features, which require that Windows is configured to  be in the Developer Mode. 
+>
+> A pre-release NVIDIA GPU driver version 590.26 or later is required for Shader Model 6.9 functionality.
 > 
-> The experimental implementation will be replaced by the official Microsoft API later in 2025, and NVIDIA driver support for the current version will be removed shortly after that.
 > All non-CoopVec versions of DX12 decompression, as well as all Vulkan versions including CoopVec, are OK to use for shipping.
 >
 > **The DX12 Cooperative Vector support is for testing purposes only. DO NOT SHIP ANY PRODUCTS USING IT.**
@@ -87,7 +88,7 @@ Operating System:
 - Linux x64
 
 Graphics APIs:
-- DirectX 12 - with Agility SDK for Cooperative Vector support (optional)
+- DirectX 12 - with preview Agility SDK for Cooperative Vector support
 - Vulkan 1.3
 
 GPU for NTC decompression on load and transcoding to BCn:
@@ -99,22 +100,23 @@ GPU for NTC inference on sample:
 - Recommended: NVIDIA Ada (RTX 4000 series) and newer.
 
 GPU for NTC compression:
-- Minimum: NVIDIA Turing and (RTX 2000 series).
+- Minimum: NVIDIA Turing (RTX 2000 series).
 - Recommended: NVIDIA Ada (RTX 4000 series) and newer.
 
 _[*] The oldest GPUs that the NTC SDK functionality has been validated on are NVIDIA GTX 1000 series, AMD Radeon RX 6000 series, Intel Arc A series._
 
-For Cooperative Vector support on NVIDIA GPUs, please use NVIDIA Graphics Driver version 570 or newer.
+For Cooperative Vector support on NVIDIA GPUs, please use the NVIDIA Graphics Driver preview version 590.26 or newer for DX12, or at least version 570 for Vulkan. The preview drivers can be downloaded using the following links (require an NVIDIA Developer Program account):
+
+- GeForce GPUs: https://developer.nvidia.com/downloads/shadermodel6-9-preview-driver
+- Quadro GPUs: https://developer.nvidia.com/downloads/assets/secure/shadermodel6-9-preview-driver-quadro
 
 For a list of software components needed to build the SDK, please refer to the [Build Guide](##Building NTC SDK).
 
 ## Known Issues
 
-The following issues are observed with NVIDIA Display Driver 572.16:
+The following issues are observed with NVIDIA Display Driver 590.26:
 
-- Cooperative Vector inference on DX12 is incompatible with NVIDIA Turing and Ampere GPUs, disabled in LibNTC.
-- Image corruption in NTC Explorer when running on Vulkan.
-- Non-CoopVec (DP4a) inference performance is lower than expected on NVIDIA Blackwell GPUs.
+- Cooperative Vector inference (both on-load and on-sample) using INT8 math is slower than expected on DX12 (bug 5341486)
 
 ## Build Guide
 
@@ -125,9 +127,9 @@ NTC SDK supports Windows x64 and Linux x64 targets.
 Building the NTC SDK on Windows requires the following components:
 
 - Visual Studio 2022 (at least the build tools)
-- [Windows SDK](https://developer.microsoft.com/en-us/windows/downloads/windows-sdk) (tested with 10.0.22621.0 and 10.0.26100.0)
+- [Windows SDK](https://developer.microsoft.com/en-us/windows/downloads/windows-sdk) (tested with 10.0.26100.0)
 - [CMake](https://cmake.org/download) (tested with v3.28 and v3.31)
-- [CUDA SDK](https://developer.nvidia.com/cuda-downloads) (tested with 12.4 and 12.8)
+- [CUDA SDK](https://developer.nvidia.com/cuda-downloads) (tested with v12.8 and v12.9)
 
 Follow the usual way of building CMake projects on Windows:
 

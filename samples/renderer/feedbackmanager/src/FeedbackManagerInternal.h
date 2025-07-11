@@ -26,6 +26,7 @@
 
 #include "../include/FeedbackManager.h"
 #include "FeedbackTexture.h"
+#include "FeedbackTextureSet.h"
 
 #include "rtxts-ttm/TiledTextureManager.h"
 
@@ -36,6 +37,7 @@ using namespace Microsoft::WRL;
 
 namespace nvfeedback
 {
+    // A really simple timer which holds just one sample
     class SimpleTimer
     {
     public:
@@ -75,26 +77,32 @@ namespace nvfeedback
         uint64_t m_frequency;
     };
 
-    class HeapAllocatorImpl : public rtxts::HeapAllocator
+    class HeapAllocator
     {
     public:
-        HeapAllocatorImpl(nvrhi::IDevice* device, uint32_t framesInFlight);
-        ~HeapAllocatorImpl() {};
+        HeapAllocator(nvrhi::IDevice* device, uint64_t heapSizeInBytes, uint32_t framesInFlight);
+        ~HeapAllocator() {};
 
-        void AllocateHeap(uint64_t heapSizeInBytes, uint32_t& heapId);
-        void ReleaseHeap(uint32_t heapId);
-        nvrhi::HeapHandle GetHeapHandle(uint32_t heapId) { return heapId ? m_heaps[heapId - 1] : nullptr; }
-        nvrhi::BufferHandle GetBufferHandle(uint32_t heapId) { return heapId ? m_buffers[heapId - 1] : nullptr; }
+        void AllocateHeap(uint32_t& heapId);
+        void ReleaseHeap(uint32_t heapId, uint32_t frameIndex);
+        nvrhi::HeapHandle GetHeapHandle(uint32_t heapId) { return m_heaps[heapId]; }
+        nvrhi::BufferHandle GetBufferHandle(uint32_t heapId) { return m_buffers[heapId]; }
 
         uint64_t GetTotalAllocatedBytes() { return m_totalAllocatedBytes; }
-        void ReleaseEmptyHeaps(bool releaseEmptyHeaps, uint32_t frameIndex);
+
+        uint32_t GetNumHeaps() { return m_numHeaps; }
 
     private:
         uint32_t m_framesInFlight;
         nvrhi::DeviceHandle m_device;
-        std::vector<uint32_t> m_freeHeapIndices;
         std::vector<nvrhi::HeapHandle> m_heaps;
         std::vector<nvrhi::BufferHandle> m_buffers;
+
+        std::vector<uint32_t> m_freeHeapIds;
+
+        uint64_t m_heapSizeInBytes;
+
+        uint32_t m_numHeaps;
         uint64_t m_totalAllocatedBytes;
 
         std::map<uint32_t, std::vector<nvrhi::HeapHandle>> m_heapsToRelease;
@@ -108,19 +116,19 @@ namespace nvfeedback
 
         ~FeedbackManagerImpl() override;
         bool CreateTexture(const nvrhi::TextureDesc& desc, FeedbackTexture** ppTex) override;
+        bool CreateTextureSet(FeedbackTextureSet** ppTexSet) override;
         void BeginFrame(nvrhi::ICommandList* commandList, const FeedbackUpdateConfig& config, FeedbackTextureCollection* results) override;
         void UpdateTileMappings(nvrhi::ICommandList* commandList, FeedbackTextureCollection* tilesReady) override;
         void ResolveFeedback(nvrhi::ICommandList* commandList) override;
         void EndFrame() override;
-        virtual FeedbackManagerStats GetStats() override;
+        FeedbackManagerStats GetStats() override;
 
         // Internal
 
         FeedbackManagerImpl(nvrhi::IDevice* device, const FeedbackManagerDesc& desc);
         void UnregisterTexture(FeedbackTextureImpl* pTex);
 
-        void AddStat_UpdateTileMappingCall(uint32_t count) { m_numUpdateTileMappingsCalls += count; }
-        void AddStat_UpdateTileMappingTime(double time) { m_cputimeDxUpdateTileMappings += time; }
+        void UpdateTextureRingBufferState(FeedbackTextureImpl* pTex, bool includeInRingBuffer);
 
         rtxts::TiledTextureManager* GetTiledTextureManager() { return m_tiledTextureManager.get(); }
 
@@ -137,26 +145,14 @@ namespace nvfeedback
         std::list<FeedbackTextureImpl*> m_texturesRingbuffer;
         std::vector<std::vector<FeedbackTextureImpl*>> m_texturesToReadback;
 
-        nvrhi::BufferHandle m_defragBuffer; // Defragmentation tile save/restore buffer
-        FeedbackTextureImpl *m_pDefragTexture; // Which texture we are defragmenting
-        rtxts::TileType m_defragTile; // Which tile in the texture is being defragmented
-
-        uint32_t m_statsTilesRequested;
-        uint32_t m_statsTilesIdle;
         FeedbackManagerStats m_statsLastFrame;
 
         SimpleTimer m_timerBeginFrame;
         SimpleTimer m_timerUpdateTileMappings;
-        double m_cputimeDxUpdateTileMappings;
         SimpleTimer m_timerResolve;
-        SimpleTimer m_timerApiResolve;
-        uint32_t m_numUpdateTileMappingsCalls;
 
-        std::shared_ptr<HeapAllocatorImpl> m_heapAllocator;
+        std::shared_ptr<HeapAllocator> m_heapAllocator;
         std::shared_ptr<rtxts::TiledTextureManager> m_tiledTextureManager;
         std::set<FeedbackTextureImpl*> m_minMipDirtyTextures;
-
-        // Used in defragmentation phase
-        std::unordered_map<uint32_t, FeedbackTextureImpl*> m_feedbackTexturesMapping;
     };
 }

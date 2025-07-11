@@ -22,9 +22,10 @@ typedef NtcNetworkParams<NETWORK_VERSION> NtcParams;
 
 #define STF_SHADER_STAGE STF_SHADER_STAGE_PIXEL
 #define STF_SHADER_MODEL_MAJOR 6
-#define STF_SHADER_MODEL_MINOR 6
+#define STF_SHADER_MODEL_MINOR 5
 #include "STFSamplerState.hlsli"
 #include "NtcForwardShadingPassConstants.h"
+#include "NtcChannelMapping.h"
 
 DECLARE_CBUFFER(MaterialConstants, g_Material, FORWARD_BINDING_MATERIAL_CONSTANTS, FORWARD_SPACE_MATERIAL);
 DECLARE_CBUFFER(ForwardShadingViewConstants, g_ForwardView, FORWARD_BINDING_VIEW_CONSTANTS, FORWARD_SPACE_VIEW);
@@ -36,16 +37,6 @@ DECLARE_CBUFFER(NtcForwardShadingPassConstants, g_Pass, FORWARD_BINDING_NTC_PASS
 DECLARE_CBUFFER(NtcTextureSetConstants, g_NtcMaterial, FORWARD_BINDING_NTC_MATERIAL_CONSTANTS, FORWARD_SPACE_MATERIAL);
 ByteAddressBuffer t_InputFile    : REGISTER_SRV(FORWARD_BINDING_NTC_LATENTS_BUFFER, FORWARD_SPACE_MATERIAL);
 ByteAddressBuffer t_WeightBuffer : REGISTER_SRV(FORWARD_BINDING_NTC_WEIGHTS_BUFFER, FORWARD_SPACE_MATERIAL);
-
-#define CHANNEL_BASE_COLOR      0
-#define CHANNEL_OPACITY         3
-#define CHANNEL_METAL_ROUGH     4
-#define CHANNEL_SPECULAR_COLOR  4
-#define CHANNEL_GLOSSINESS      7
-#define CHANNEL_NORMAL          8
-#define CHANNEL_OCCLUSION       11
-#define CHANNEL_EMISSIVE        12
-#define CHANNEL_TRANSMISSION    15
 
 void GetSamplePositionWithSTF(inout HashBasedRNG rng, float2 uv, out int2 texel, out int mipLevel)
 {
@@ -96,95 +87,60 @@ MaterialTextureSample SampleNtcMaterial(uint2 pixelPosition, float2 uv)
         t_WeightBuffer, 0, texel, mipLevel, linearizeColorsOnSample, channels);
 #endif
 
-    // Initialize the 'textures' object with default values to avoid corruption when not all textures are present.
+    // Initialize the 'textures' object with default values, just in case we miss something below.
     MaterialTextureSample textures = DefaultMaterialTextures();
 
     // Distribute the NTC channels into the MaterialTextureSample's fields using a fixed mapping.
-    // The same fixed mapping is used by the scene preparation script, ../tools/convert_gltf_materials.py
+    // The mapping is enforced by the loader, see NtcMaterialLoader.cpp
+    // If some texture channels are not present in the NTC material file, they are replaced with constant values
+    // by the loader.
     
-    if (NtcTextureSetHasChannels(g_NtcMaterial, CHANNEL_BASE_COLOR, 3))
-    {
-        textures.baseOrDiffuse.rgb = float3(
-            channels[CHANNEL_BASE_COLOR + 0],
-            channels[CHANNEL_BASE_COLOR + 1],
-            channels[CHANNEL_BASE_COLOR + 2]);
+    textures.baseOrDiffuse.rgb = float3(
+        channels[CHANNEL_BASE_COLOR + 0],
+        channels[CHANNEL_BASE_COLOR + 1],
+        channels[CHANNEL_BASE_COLOR + 2]);
 
 
-        if (!linearizeColorsOnSample)
-            textures.baseOrDiffuse.rgb = NtcSrgbColorSpace::Decode(textures.baseOrDiffuse.rgb);
-    }
+    if (!linearizeColorsOnSample)
+        textures.baseOrDiffuse.rgb = NtcSrgbColorSpace::Decode(textures.baseOrDiffuse.rgb);
 
-    if (NtcTextureSetHasChannels(g_NtcMaterial, CHANNEL_OPACITY, 1))
-    {
-        textures.opacity.r = channels[CHANNEL_OPACITY];
-    }
+    textures.opacity.r = channels[CHANNEL_OPACITY];
 
     if ((g_Material.flags & MaterialFlags_UseSpecularGlossModel) != 0)
     {
-        if (NtcTextureSetHasChannels(g_NtcMaterial, CHANNEL_SPECULAR_COLOR, 3))
-        {
-            textures.metalRoughOrSpecular.rgb = float3(
-                channels[CHANNEL_SPECULAR_COLOR + 0],
-                channels[CHANNEL_SPECULAR_COLOR + 1],
-                channels[CHANNEL_SPECULAR_COLOR + 2]);
-                
-            if (!linearizeColorsOnSample)
-                textures.metalRoughOrSpecular.rgb = NtcSrgbColorSpace::Decode(textures.metalRoughOrSpecular.rgb);
-        }
+        textures.metalRoughOrSpecular.rgb = float3(
+            channels[CHANNEL_SPECULAR_COLOR + 0],
+            channels[CHANNEL_SPECULAR_COLOR + 1],
+            channels[CHANNEL_SPECULAR_COLOR + 2]);
+            
+        if (!linearizeColorsOnSample)
+            textures.metalRoughOrSpecular.rgb = NtcSrgbColorSpace::Decode(textures.metalRoughOrSpecular.rgb);
         
-        if (NtcTextureSetHasChannels(g_NtcMaterial, CHANNEL_GLOSSINESS, 1))
-        {
-            textures.metalRoughOrSpecular.a = channels[CHANNEL_GLOSSINESS];
-        }
+        textures.metalRoughOrSpecular.a = channels[CHANNEL_GLOSSINESS];
     }
     else
     {
-        if (NtcTextureSetHasChannels(g_NtcMaterial, CHANNEL_METAL_ROUGH, 2))
-        {
-            textures.metalRoughOrSpecular.rg = float2(
-                channels[CHANNEL_METAL_ROUGH + 0],
-                channels[CHANNEL_METAL_ROUGH + 1]);
-        }
+        textures.metalRoughOrSpecular.g = channels[CHANNEL_ROUGHNESS];
+        textures.metalRoughOrSpecular.r = channels[CHANNEL_METALNESS];
     }
 
-    if (NtcTextureSetHasChannels(g_NtcMaterial, CHANNEL_NORMAL, 3))
-    {
-        textures.normal.rgb = float3(
-            channels[CHANNEL_NORMAL + 0],
-            channels[CHANNEL_NORMAL + 1],
-            channels[CHANNEL_NORMAL + 2]);
-    }
+    textures.normal.rgb = float3(
+        channels[CHANNEL_NORMAL + 0],
+        channels[CHANNEL_NORMAL + 1],
+        channels[CHANNEL_NORMAL + 2]);
 
-    if (NtcTextureSetHasChannels(g_NtcMaterial, CHANNEL_OCCLUSION, 1))
-    {
-        textures.occlusion.r = channels[CHANNEL_OCCLUSION];
-    }
+    textures.occlusion.r = channels[CHANNEL_OCCLUSION];
+
+    textures.emissive.rgb = float3(
+        channels[CHANNEL_EMISSIVE + 0],
+        channels[CHANNEL_EMISSIVE + 1],
+        channels[CHANNEL_EMISSIVE + 2]);
+
+    if (!linearizeColorsOnSample)
+        textures.emissive.rgb = NtcSrgbColorSpace::Decode(textures.emissive.rgb);
     
-    if (NtcTextureSetHasChannels(g_NtcMaterial, CHANNEL_EMISSIVE, 3))
-    {
-        textures.emissive.rgb = float3(
-            channels[CHANNEL_EMISSIVE + 0],
-            channels[CHANNEL_EMISSIVE + 1],
-            channels[CHANNEL_EMISSIVE + 2]);
-
-        if (!linearizeColorsOnSample)
-            textures.emissive.rgb = NtcSrgbColorSpace::Decode(textures.emissive.rgb);
-    }
-    else if (NtcTextureSetHasChannels(g_NtcMaterial, CHANNEL_EMISSIVE, 1))
-    {
-        float emissive = channels[CHANNEL_EMISSIVE];
-
-        if (!linearizeColorsOnSample)
-            emissive = NtcSrgbColorSpace::Decode(emissive);
-
-        textures.emissive.rgb = emissive.rrr;
-    }
-
-    if (NtcTextureSetHasChannels(g_NtcMaterial, CHANNEL_TRANSMISSION, 1))
-    {
-        textures.transmission.r = channels[CHANNEL_TRANSMISSION];
-    }
-
+    textures.transmission.r = channels[CHANNEL_TRANSMISSION];
+    
     return textures;
 }
 #endif

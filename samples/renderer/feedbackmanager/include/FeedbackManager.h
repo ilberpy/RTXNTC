@@ -19,6 +19,8 @@
 
 namespace nvfeedback
 {
+    class FeedbackTextureSet;
+
     struct FeedbackTextureTileInfo
     {
         uint32_t mip;
@@ -37,6 +39,7 @@ namespace nvfeedback
         }
     };
 
+    // A tiled texture with sampler feedback
     class FeedbackTexture
     {
     public:
@@ -48,25 +51,40 @@ namespace nvfeedback
         virtual nvrhi::TextureHandle GetMinMipTexture() = 0;
         virtual bool IsTilePacked(uint32_t tileIndex) = 0;
         virtual void GetTileInfo(uint32_t tileIndex, std::vector<FeedbackTextureTileInfo>& tiles) = 0;
+
+        virtual uint32_t GetNumTextureSets() const = 0;
+        virtual FeedbackTextureSet* GetTextureSet(uint32_t index) const = 0;
+    };
+
+    // A collection of FeedbackTextures with shared lifetime
+    class FeedbackTextureSet
+    {
+    public:
+        virtual unsigned long AddRef() = 0;
+        virtual unsigned long Release() = 0;
+
+        virtual uint32_t GetNumTextures() const = 0;
+        virtual FeedbackTexture* GetTexture(uint32_t index) = 0;
+
+        virtual void SetPrimaryTextureIndex(uint32_t index) = 0;
+        virtual uint32_t GetPrimaryTextureIndex() const = 0;
+        virtual FeedbackTexture* GetPrimaryTexture() const = 0;
+        
+        virtual bool AddTexture(FeedbackTexture* texture) = 0;
+        virtual bool RemoveTexture(FeedbackTexture* texture) = 0;
     };
 
     struct FeedbackManagerStats
     {
         uint64_t heapAllocationInBytes; // The amount of heap space allocated in bytes
+        uint32_t heapTilesFree;         // Number of free tiles in allocated heaps
         uint32_t tilesTotal;            // Total number of tiles tracked in all textures
-        uint32_t tilesRequested;        // Number of tiles actively being requested for rendering
         uint32_t tilesAllocated;        // Number of tiles allocated in heaps
-        uint32_t tilesIdle;             // Number of tiles no longer being requested but not freed
         uint32_t tilesStandby;          // Number of tiles in the standby queue
 
         double cputimeBeginFrame;
         double cputimeUpdateTileMappings;
         double cputimeResolve;
-
-        double cputimeDxUpdateTileMappings;
-        double cputimeDxResolve;
-
-        uint32_t numUpdateTileMappingsCalls;
     };
 
     struct FeedbackUpdateConfig
@@ -75,8 +93,9 @@ namespace nvfeedback
         uint32_t maxTexturesToUpdate; // Max textures to update, 0=unlimited
         float tileTimeoutSeconds; // Timeout of tile allocation in seconds
         bool defragmentHeaps; // Enable defragmentation of heaps
-        bool releaseEmptyHeaps; // Enable releasing of empty heaps
-        uint32_t maxStandbyTiles; // Maximum number of tiles in the standby queue
+        bool trimStandbyTiles; // Enables trimming of standby tiles to the target number
+        bool releaseEmptyHeaps; // Release empty heaps
+        uint32_t numExtraStandbyTiles; // Target number of tiles to keep in standby before being evicted
     };
 
     struct FeedbackTextureUpdate
@@ -104,6 +123,9 @@ namespace nvfeedback
 
         // Creates a FeedbackTexture
         virtual bool CreateTexture(const nvrhi::TextureDesc& desc, FeedbackTexture** ppTex) = 0;
+
+        // Creates an empty FeedbackTextureSet
+        virtual bool CreateTextureSet(FeedbackTextureSet** ppTexSet) = 0;
 
         // Call at the beginning of the frame. Reads back the feedback resources from N frames ago.
         virtual void BeginFrame(nvrhi::ICommandList* commandList, const FeedbackUpdateConfig& config, FeedbackTextureCollection* results) = 0;

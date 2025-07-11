@@ -49,8 +49,9 @@ bool FlatImageView::Init(nvrhi::IFramebuffer* framebuffer)
     if (m_graphicsPipeline)
         return true;
 
-    auto pixelShaderDesc = nvrhi::ShaderDesc(nvrhi::ShaderType::Pixel);
-    pixelShaderDesc.entryName = "MainPS";
+    auto pixelShaderDesc = nvrhi::ShaderDesc()
+        .setShaderType(nvrhi::ShaderType::Pixel)
+        .setEntryName("MainPS");
 
     m_pixelShader = m_shaderFactory->CreateStaticPlatformShader(DONUT_MAKE_PLATFORM_SHADER(g_FlatImageView_MainPS),
         nullptr, pixelShaderDesc);

@@ -1275,11 +1275,20 @@ public:
         ntcStatus = metadata->GetStreamRangeForLatents(0, textureSetDesc.mips, streamRange);
         if (ntcStatus != ntc::Status::Ok)
             return ntcStatus;
+
+        ntc::InferenceWeightType weightType = metadata->GetBestSupportedWeightType();
+        if (weightType == ntc::InferenceWeightType::Unknown)
+            return ntc::Status::Unsupported;
         
-        // Open the command list, copy the file data from the staging buffer
+        // Open the command list, upload the latents and weights
         m_commandList->open();
         m_commandList->beginMarker("Upload NTC Data");
         if (!m_decompressionPass.SetInputData(m_commandList, inputStream, streamRange))
+        {
+            m_commandList->close();
+            return ntc::Status::InternalError;
+        }
+        if (!m_decompressionPass.SetWeightsFromTextureSet(m_commandList, metadata, weightType))
         {
             m_commandList->close();
             return ntc::Status::InternalError;
@@ -1301,7 +1310,7 @@ public:
             params.mipLevel = mipLevel;
             params.firstOutputDescriptorIndex = mipLevel * int(m_images.size());
             params.pSrcRect = m_useGapiDecompressionRect ? &m_gapiDecompressionRect : nullptr;
-            params.enableFP8 = m_useFp8Decompression;
+            params.weightType = weightType;
             ntcStatus = m_ntcContext->MakeDecompressionComputePass(params, &computePass);
 
             // On failure, close/abandon the command list and return
@@ -1766,7 +1775,13 @@ public:
                 if (m_showCompressionProgress && ntcStatus == ntc::Status::Incomplete)
                 {
                     if (!DecompressIntoTextures(false, true, false, beginTime))
+                    {
+                        // If the user clicks Cancel while decompression is running, DecompressIntoTextures(...)
+                        // doesn't call AbortCompression() - do that here to avoid leaving the texture set
+                        // in an incorrect state, which prevents further compression attempts.
+                        m_textureSet->AbortCompression();
                         return false;
+                    }
                 }
 
                 snprintf(textureName, sizeof textureName, "[%d%%]", (stats.currentStep * 100) / m_compressionSettings.trainingSteps);

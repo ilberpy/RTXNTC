@@ -71,22 +71,25 @@ bool ModelView::Init(nvrhi::IFramebuffer* framebuffer)
 {
     if (!m_vertexShader)
     {        
-        auto vertexShaderDesc = nvrhi::ShaderDesc(nvrhi::ShaderType::Vertex);
-        vertexShaderDesc.entryName = "MainVS";
+        auto vertexShaderDesc = nvrhi::ShaderDesc()
+            .setShaderType(nvrhi::ShaderType::Vertex)
+            .setEntryName("MainVS");
         m_vertexShader = m_shaderFactory->CreateStaticPlatformShader(DONUT_MAKE_PLATFORM_SHADER(g_ModelView_MainVS), nullptr, vertexShaderDesc);
     }
 
     if (!m_pixelShader)
     {
-        auto pixelShaderDesc = nvrhi::ShaderDesc(nvrhi::ShaderType::Pixel);
-        pixelShaderDesc.entryName = "MainPS";
+        auto pixelShaderDesc = nvrhi::ShaderDesc()
+            .setShaderType(nvrhi::ShaderType::Pixel)
+            .setEntryName("MainPS");
         m_pixelShader = m_shaderFactory->CreateStaticPlatformShader(DONUT_MAKE_PLATFORM_SHADER(g_ModelView_MainPS), nullptr, pixelShaderDesc);
     }
 
     if (!m_overlayPixelShader)
     {
-        auto pixelShaderDesc = nvrhi::ShaderDesc(nvrhi::ShaderType::Pixel);
-        pixelShaderDesc.entryName = "OverlayPS";
+        auto pixelShaderDesc = nvrhi::ShaderDesc()
+            .setShaderType(nvrhi::ShaderType::Pixel)
+            .setEntryName("OverlayPS");
         m_overlayPixelShader = m_shaderFactory->CreateStaticPlatformShader(DONUT_MAKE_PLATFORM_SHADER(g_ModelView_OverlayPS), nullptr, pixelShaderDesc);
     }
 

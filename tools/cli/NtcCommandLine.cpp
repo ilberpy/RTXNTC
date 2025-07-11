@@ -1385,7 +1385,7 @@ bool DecompressTextureSet(ntc::IContext* context, ntc::ITextureSet* textureSet, 
     ntc::Status ntcStatus = textureSet->Decompress(&stats, useFP8Weights);
     CHECK_NTC_RESULT(NtcDecompress);
 
-    printf("CUDA decompression time: %.2f ms\n", stats.gpuTimeMilliseconds);
+    printf("CUDA decompression time: %.3f ms\n", stats.gpuTimeMilliseconds);
 
     if (g_options.inputType == ToolInputType::Directory ||
         g_options.inputType == ToolInputType::Manifest ||
@@ -1957,7 +1957,8 @@ int main(int argc, const char** argv)
         if (g_options.benchmarkIterations > 1)
         {
             float const medianDecompressionTime = Median(iterationTimes);
-            printf("Median decompression time over %d iterations: %.2f ms\n", g_options.benchmarkIterations, medianDecompressionTime * 1e3f);
+            printf("Median decompression time over %d iterations: %.3f ms\n", g_options.benchmarkIterations,
+                medianDecompressionTime * 1e3f);
         }
 
         bool const anyBCTextures = AnyBlockCompressedTextures(metadata);

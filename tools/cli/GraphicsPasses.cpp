@@ -247,6 +247,19 @@ bool DecompressTextureSetWithGraphicsAPI(
         }
     }
 
+    ntc::InferenceWeightType weightType = metadata->GetBestSupportedWeightType();
+    if (weightType == ntc::InferenceWeightType::Unknown)
+    {
+        fprintf(stderr, "The texture set does not provide any weights compatible with the current device.\n");
+        return false;
+    }
+
+    if (!gdp.SetWeightsFromTextureSet(commandList, metadata, weightType))
+    {
+        fprintf(stderr, "GraphicsDecompressionPass::SetWeightsFromTextureSet failed.\n");
+        return false;
+    }
+
     commandList->beginTimerQuery(timerQuery);
 
     // Decompress each mip level in a loop
@@ -258,7 +271,7 @@ bool DecompressTextureSetWithGraphicsAPI(
         params.latentStreamRange = streamRange;
         params.mipLevel = mipLevel;
         params.firstOutputDescriptorIndex = mipLevel * numTextures;
-        params.enableFP8 = true;
+        params.weightType = weightType;
         ntc::ComputePassDesc computePass{};
         ntc::Status ntcStatus = context->MakeDecompressionComputePass(params, &computePass);
         CHECK_NTC_RESULT("MakeDecompressionComputePass");

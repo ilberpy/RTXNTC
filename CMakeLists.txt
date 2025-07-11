@@ -38,13 +38,8 @@ endif ()
 
 if (WIN32)
     set(NTC_BINARY_DIR "${CMAKE_SOURCE_DIR}/bin/windows-x64" CACHE PATH "Output directory for the NTC SDK build")
-    set(DXC_PATH       "${CMAKE_SOURCE_DIR}/libraries/RTXNTC-Library/external/dxc/windows-x64/bin/dxc.exe" CACHE FILEPATH "")
-    set(DXC_SPIRV_PATH "${CMAKE_SOURCE_DIR}/libraries/RTXNTC-Library/external/dxc/windows-x64/bin/dxc.exe" CACHE FILEPATH "")
-    set(SLANG_COMPILER "${CMAKE_SOURCE_DIR}/libraries/RTXNTC-Library/external/slang/windows-x64/release/slangc.exe")
 else()
     set(NTC_BINARY_DIR "${CMAKE_SOURCE_DIR}/bin/linux-x64" CACHE PATH "Output directory for the NTC SDK build")
-    set(DXC_SPIRV_PATH "${CMAKE_SOURCE_DIR}/libraries/RTXNTC-Library/external/dxc/linux-x64/bin/dxc" CACHE FILEPATH "")
-    set(SLANG_COMPILER "${CMAKE_SOURCE_DIR}/libraries/RTXNTC-Library/external/slang/linux-x64/bin/slangc")
 endif()
 
 file(MAKE_DIRECTORY ${NTC_BINARY_DIR})
@@ -52,18 +47,19 @@ file(MAKE_DIRECTORY ${NTC_BINARY_DIR})
 # Place libntc.dll/.so directly into our /bin
 set(LIBNTC_BIN_DIRECTORY ${NTC_BINARY_DIR})
 
-if (EXISTS "${SLANG_COMPILER}")
-    set(NTC_WITH_COOPVEC ON)
-else()
-    message("Slang compiler not found - disabling CoopVec support.")
-    set(NTC_WITH_COOPVEC OFF)
-endif()
-
 set (CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
     set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-switch")
 endif()
+
+# Configure the shader compiler versions and download options before including donut and therefore ShaderMake
+
+include(libraries/RTXNTC-Library/tools/ConfigureCompilers.cmake)
+LibNTC_ConfigureShaderCompilerVersions()
+
+# Include the Donut framework with all of its dependencies like NVRHI and ShaderMake.
+# Note: ShaderMake downloads the DXC and Slang binaries from GitHub when SHADERMAKE_FIND_COMPILERS is ON.
 
 add_subdirectory(external/donut)
 
@@ -108,7 +104,6 @@ endif()
 
 option(NTC_WITH_DX12 "" "${DONUT_WITH_DX12}")
 option(NTC_WITH_VULKAN "" "${DONUT_WITH_VULKAN}")
-set(NTC_NVAPI_PATH "${CMAKE_SOURCE_DIR}/external/nvapi" CACHE PATH "" FORCE)
 
 add_subdirectory(libraries/RTXNTC-Library)
 
@@ -118,7 +113,7 @@ if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/external/DLSS.cmake")
 endif()
 
 if (DONUT_WITH_DX12)
-    set(DONUT_D3D_AGILITY_SDK_URL "https://www.nuget.org/api/v2/package/Microsoft.Direct3D.D3D12/1.614.1")
+    set(DONUT_D3D_AGILITY_SDK_URL "https://www.nuget.org/api/v2/package/Microsoft.Direct3D.D3D12/1.717.1-preview")
     set(DONUT_D3D_AGILITY_SDK_FETCH_DIR "${CMAKE_CURRENT_SOURCE_DIR}/external/dx12-agility-sdk" CACHE STRING "" FORCE)
     include("${CMAKE_CURRENT_SOURCE_DIR}/external/donut/cmake/FetchAgilitySDK.cmake")
     include(ConfigureAgilitySDK)

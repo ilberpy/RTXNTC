@@ -12,12 +12,14 @@
 
 #include "NtcMaterialLoader.h"
 #include "NtcMaterial.h"
+#include "NtcChannelMapping.h"
 #include <ntc-utils/GraphicsDecompressionPass.h>
 #include <ntc-utils/GraphicsBlockCompressionPass.h>
 #include <ntc-utils/DeviceUtils.h>
 
 #include <donut/core/log.h>
 #include <donut/core/string_utils.h>
+#include <donut/core/vfs/VFS.h>
 #include <donut/engine/Scene.h>
 
 #include <sstream>
@@ -64,7 +66,7 @@ bool NtcMaterialLoader::Init(bool enableCoopVecInt8, bool enableCoopVecFP8, nvrh
     m_dummyTexture->texture = dummyTexture;
 
     m_graphicsDecompressionPass = std::make_shared<GraphicsDecompressionPass>(m_device,
-        /* descriptorTableSize = */ 8 * NTC_MAX_MIPS);
+        /* descriptorTableSize = */ g_maxTileStagingTextures * 2 * TRANSCODE_BATCH_SIZE);
     if (!m_graphicsDecompressionPass->Init())
         return false;
 
@@ -74,6 +76,15 @@ bool NtcMaterialLoader::Init(bool enableCoopVecInt8, bool enableCoopVecFP8, nvrh
         return false;
 
     m_commandList = m_device->createCommandList(nvrhi::CommandListParameters().setEnableImmediateExecution(false));
+
+    // Create a buffer for uploading inference weights before their conversion to CoopVec format
+
+    nvrhi::BufferDesc uploadBufferDesc = nvrhi::BufferDesc()
+        .setByteSize(65536) // Should be enough for all weight types, validated in the upload code
+        .setDebugName("Weight upload buffer")
+        .setInitialState(nvrhi::ResourceStates::CopyDest)
+        .setKeepInitialState(true);
+    m_weightUploadBuffer = m_device->createBuffer(uploadBufferDesc);
 
     // Create tile staging color textures
     // All these textures are transient and could be aliased with other temp texture resources
@@ -92,27 +103,24 @@ bool NtcMaterialLoader::Init(bool enableCoopVecInt8, bool enableCoopVecFP8, nvrh
         .setInitialState(nvrhi::ResourceStates::ShaderResource)
         .setKeepInitialState(true);
 
-    for (uint32_t i = 0; i < g_maxTileStagingTextures; i++)
+    for (uint32_t i = 0; i < g_maxTileStagingTextures * TRANSCODE_BATCH_SIZE; i++)
     {
-        nvrhi::TextureHandle tex;
-
         colorTextureDesc.setFormat(nvrhi::Format::R8_UNORM);
-        tex = m_device->createTexture(colorTextureDesc);
+        colorTextureDesc.setDebugName("Tile Color R8 " + std::to_string(i));
+        nvrhi::TextureHandle tex = m_device->createTexture(colorTextureDesc);
         if (!tex)
             return false;
-        m_texTileColorR8.push_back(tex);
+        m_texTranscodeTiles.push_back(tex);
+    }
 
-        colorTextureDesc.setFormat(nvrhi::Format::SRGBA8_UNORM);
-        tex = m_device->createTexture(colorTextureDesc);
-        if (!tex)
-            return false;
-        m_texTileColorSRGBA.push_back(tex);
-
+    for (uint32_t i = 0; i < g_maxTileStagingTextures * TRANSCODE_BATCH_SIZE; i++)
+    {
         colorTextureDesc.setFormat(nvrhi::Format::RGBA8_UNORM);
-        tex = m_device->createTexture(colorTextureDesc);
-        m_texTileColorRGBA.push_back(tex);
+        colorTextureDesc.setDebugName("Tile Color RGBA " + std::to_string(i));
+        nvrhi::TextureHandle tex = m_device->createTexture(colorTextureDesc);
         if (!tex)
             return false;
+        m_texTranscodeTiles.push_back(tex);
     }
 
     // Create tile staging block textures
@@ -125,43 +133,254 @@ bool NtcMaterialLoader::Init(bool enableCoopVecInt8, bool enableCoopVecFP8, nvrh
         .setIsUAV(true)
         .setInitialState(nvrhi::ResourceStates::UnorderedAccess)
         .setKeepInitialState(true);
-    
-    blockTextureDesc.setFormat(nvrhi::Format::RG32_UINT);
-    m_texTileBlocksRG = m_device->createTexture(blockTextureDesc);
-    if (!m_texTileBlocksRG)
-        return false;
+        
+    for (uint32_t i = 0; i < g_maxTileStagingTextures * TRANSCODE_BATCH_SIZE; i++)
+    {
+        blockTextureDesc.setFormat(nvrhi::Format::RG32_UINT);
+        blockTextureDesc.setDebugName("Tile Blocks RG " + std::to_string(i));
+        nvrhi::TextureHandle tex = m_device->createTexture(blockTextureDesc);
+        if (!tex)
+            return false;
+        m_texTranscodeTiles.push_back(tex);
+    }
 
-    blockTextureDesc.setFormat(nvrhi::Format::RGBA32_UINT);
-    m_texTileBlocksRGBA = m_device->createTexture(blockTextureDesc);
-    if (!m_texTileBlocksRGBA)
-        return false;
+    for (uint32_t i = 0; i < g_maxTileStagingTextures * TRANSCODE_BATCH_SIZE; i++)
+    {
+        blockTextureDesc.setFormat(nvrhi::Format::RGBA32_UINT);
+        blockTextureDesc.setDebugName("Tile Blocks RGBA " + std::to_string(i));
+        nvrhi::TextureHandle tex = m_device->createTexture(blockTextureDesc);
+        if (!tex)
+            return false;
+        m_texTranscodeTiles.push_back(tex);
+    }
+
+    m_texTileColorR8Offset = 0;
+    m_texTileColorRGBAOffset = 1 * g_maxTileStagingTextures * TRANSCODE_BATCH_SIZE;
+    m_texTileBlocksRGOffset = 2 * g_maxTileStagingTextures * TRANSCODE_BATCH_SIZE;
+    m_texTileBlocksRGBAOffset = 3 * g_maxTileStagingTextures * TRANSCODE_BATCH_SIZE;
 
     return true;
 }
 
-static bool LoadMaterialFile(fs::path const& ntcFileName, NtcMaterial& material, ntc::IContext* ntcContext,
-    ntc::FileStreamWrapper& ntcFile, ntc::TextureSetMetadataWrapper& textureSetMetadata)
+static bool TextureSetHasChannels(uint32_t mask, int first, int count)
+{
+    uint32_t test = ((1u << count) - 1) << first;
+    return (mask & test) == test;
+}
+
+static void FillMaterialTranscodeMapping(NtcMaterial& material, ntc::ITextureSetMetadata* textureSetMetadata,
+    MaterialChannelMap const& channelMap, bool onlyAlphaMask)
+{
+    // Derive the valid channel mask from the shuffle map, because textureSetMetadata->GetValidChannelMask()
+    // returns "1" bits for constant channels, and we want to know where actual textures exist.
+    uint32_t channelMask = 0;
+    for (int ch = 0; ch < NTC_MAX_CHANNELS; ++ch)
+    {
+        if (channelMap.swizzle[ch].type == ntc::ShuffleSourceType::Channel)
+            channelMask |= (1 << ch);
+    }
+
+    // If we only need to create the alpha mask texture, see if the material actually needs an alpha mask
+    // and if the NTC texture set has an alpha mask channel.
+    if (onlyAlphaMask)
+    {
+        // Test the channel mask for the presence of opacity channel.
+        // Note: not testing the material domain because in some cases, one texture set can be reused
+        // for multiple materials with different domains, and we cache and reuse the transcode mapping.
+        // One model with such reuse is AlphaBlendModeTest from the Khronos glTF sample asset collection.
+        bool opacityChannelPresent = TextureSetHasChannels(channelMask, CHANNEL_OPACITY, 1);
+
+        if (!opacityChannelPresent)
+            return;
+
+        TextureTranscodeTask& opacityTexture = material.transcodeMapping.emplace_back();
+        opacityTexture.bcFormat = ntc::BlockCompressedFormat::BC4;
+        opacityTexture.nvrhiBcFormat = nvrhi::Format::BC4_UNORM;
+        opacityTexture.firstChannel = CHANNEL_OPACITY;
+        opacityTexture.numChannels = 1;
+        opacityTexture.pMaterialTexture = &NtcMaterial::opacityTexture;
+        opacityTexture.pFeedbackTexture = &NtcMaterial::opacityTextureFeedback;
+        opacityTexture.name = "Opacity";
+    }
+    else
+    {
+        if (TextureSetHasChannels(channelMask, CHANNEL_BASE_COLOR, 3))
+        {
+            TextureTranscodeTask& baseColorTexture = material.transcodeMapping.emplace_back();
+            baseColorTexture.bcFormat = ntc::BlockCompressedFormat::BC7;
+            baseColorTexture.nvrhiBcFormat = nvrhi::Format::BC7_UNORM_SRGB;
+            baseColorTexture.firstChannel = CHANNEL_BASE_COLOR;
+            baseColorTexture.numChannels = TextureSetHasChannels(channelMask, CHANNEL_OPACITY, 1) ? 4 : 3;
+            static_assert(CHANNEL_OPACITY == CHANNEL_BASE_COLOR + 3);
+            baseColorTexture.sRGB = true;
+            baseColorTexture.pMaterialTexture = &NtcMaterial::baseOrDiffuseTexture;
+            baseColorTexture.pFeedbackTexture = &NtcMaterial::baseOrDiffuseTextureFeedback;
+            baseColorTexture.name = "BaseColor";
+        }
+        
+        if (material.useSpecularGlossModel)
+        {
+            if (TextureSetHasChannels(channelMask, CHANNEL_SPECULAR_COLOR, 3))
+            {
+                TextureTranscodeTask& specularTexture = material.transcodeMapping.emplace_back();
+                specularTexture.bcFormat = ntc::BlockCompressedFormat::BC7;
+                specularTexture.nvrhiBcFormat = nvrhi::Format::BC7_UNORM_SRGB;
+                specularTexture.firstChannel = CHANNEL_SPECULAR_COLOR;
+                specularTexture.numChannels = TextureSetHasChannels(channelMask, CHANNEL_GLOSSINESS, 1) ? 4 : 3;
+                static_assert(CHANNEL_GLOSSINESS == CHANNEL_SPECULAR_COLOR + 3);
+                specularTexture.sRGB = true;
+                specularTexture.pMaterialTexture = &NtcMaterial::metalRoughOrSpecularTexture;
+                specularTexture.pFeedbackTexture = &NtcMaterial::metalRoughOrSpecularTextureFeedback;
+                specularTexture.name = "SpecularColor";
+            }
+        }
+        else
+        {
+            if (TextureSetHasChannels(channelMask, CHANNEL_METALNESS, 2))
+            {
+                TextureTranscodeTask& metalRoughTexture = material.transcodeMapping.emplace_back();
+                metalRoughTexture.bcFormat = ntc::BlockCompressedFormat::BC5;
+                metalRoughTexture.nvrhiBcFormat = nvrhi::Format::BC5_UNORM;
+                metalRoughTexture.firstChannel = CHANNEL_METALNESS;
+                metalRoughTexture.numChannels = 2;
+                static_assert(CHANNEL_ROUGHNESS == CHANNEL_METALNESS + 1);
+                metalRoughTexture.pMaterialTexture = &NtcMaterial::metalRoughOrSpecularTexture;
+                metalRoughTexture.pFeedbackTexture = &NtcMaterial::metalRoughOrSpecularTextureFeedback;
+                metalRoughTexture.name = "MetallicRoughness";
+            }
+            
+            if (TextureSetHasChannels(channelMask, CHANNEL_OCCLUSION, 1))
+            {
+                TextureTranscodeTask& occlusionTexture = material.transcodeMapping.emplace_back();
+                occlusionTexture.bcFormat = ntc::BlockCompressedFormat::BC4;
+                occlusionTexture.nvrhiBcFormat = nvrhi::Format::BC4_UNORM;
+                occlusionTexture.firstChannel = CHANNEL_OCCLUSION;
+                occlusionTexture.numChannels = 1;
+                occlusionTexture.pMaterialTexture = &NtcMaterial::occlusionTexture;
+                occlusionTexture.pFeedbackTexture = &NtcMaterial::occlusionTextureFeedback;
+                occlusionTexture.name = "Occlusion";
+            }
+        }
+        
+        if (TextureSetHasChannels(channelMask, CHANNEL_NORMAL, 3))
+        {
+            TextureTranscodeTask& normalTexture = material.transcodeMapping.emplace_back();
+            normalTexture.bcFormat = ntc::BlockCompressedFormat::BC7;
+            normalTexture.nvrhiBcFormat = nvrhi::Format::BC7_UNORM;
+            normalTexture.firstChannel = CHANNEL_NORMAL;
+            normalTexture.numChannels = 3;
+            normalTexture.pMaterialTexture = &NtcMaterial::normalTexture;
+            normalTexture.pFeedbackTexture = &NtcMaterial::normalTextureFeedback;
+            normalTexture.name = "Normal";
+        }
+
+        if (TextureSetHasChannels(channelMask, CHANNEL_EMISSIVE, 3))
+        {
+            TextureTranscodeTask& emissiveTexture = material.transcodeMapping.emplace_back();
+            emissiveTexture.bcFormat = ntc::BlockCompressedFormat::BC7;
+            emissiveTexture.nvrhiBcFormat = nvrhi::Format::BC7_UNORM_SRGB;
+            emissiveTexture.firstChannel = CHANNEL_EMISSIVE;
+            emissiveTexture.numChannels = 3;
+            emissiveTexture.sRGB = true;
+            emissiveTexture.pMaterialTexture = &NtcMaterial::emissiveTexture;
+            emissiveTexture.pFeedbackTexture = &NtcMaterial::emissiveTextureFeedback;
+            emissiveTexture.name = "Emissive";
+        }
+
+        if (TextureSetHasChannels(channelMask, CHANNEL_TRANSMISSION, 1))
+        {
+            TextureTranscodeTask& transmissionTexture = material.transcodeMapping.emplace_back();
+            transmissionTexture.bcFormat = ntc::BlockCompressedFormat::BC4;
+            transmissionTexture.nvrhiBcFormat = nvrhi::Format::BC4_UNORM;
+            transmissionTexture.firstChannel = CHANNEL_TRANSMISSION;
+            transmissionTexture.numChannels = 1;
+            transmissionTexture.pMaterialTexture = &NtcMaterial::transmissionTexture;
+            transmissionTexture.pFeedbackTexture = &NtcMaterial::transmissionTextureFeedback;
+            transmissionTexture.name = "Transmission";
+        }
+    }
+
+    ntc::TextureSetDesc const& textureSetDesc = textureSetMetadata->GetDesc();
+    for (int textureIndex = 0; textureIndex < material.transcodeMapping.size(); ++textureIndex)
+    {
+        TextureTranscodeTask& textureVersions = material.transcodeMapping[textureIndex];
+
+        // Figure out which channels in the original NTC texture set correspond to the channels for this texture
+        std::array<int, 4> originalChannels;
+        originalChannels.fill(-1);
+        bool originalChannelsSequential = true;
+        for (int ch = 0; ch < textureVersions.numChannels; ++ch)
+        {
+            ntc::ShuffleSource const& src = channelMap.swizzle[textureVersions.firstChannel + ch];
+            originalChannels[ch] = src.GetChannelIndex();
+            if (ch > 0 && originalChannels[ch] != originalChannels[ch-1] + 1)
+                originalChannelsSequential = false;
+        }
+        
+        // If this texture covers a contiguous span of channels in the NTC texture set, try to find a matching
+        // texture metadata object. It's only needed for BC7 encoding acceleration, so no big deal if it's not found.
+        if (originalChannelsSequential)
+        {
+            for (int ntcTextureIndex = 0; ntcTextureIndex < textureSetMetadata->GetTextureCount(); ++ntcTextureIndex)
+            {
+                ntc::ITextureMetadata* textureMetadata = textureSetMetadata->GetTexture(ntcTextureIndex);
+                if (textureMetadata->GetFirstChannel() == originalChannels[0] &&
+                    textureMetadata->GetNumChannels() >= textureVersions.numChannels)
+                {
+                    textureVersions.metadata = textureMetadata;
+                    break;
+                }
+            }
+        }
+    }
+}
+
+static bool LoadMaterialFile(donut::engine::FilePathOrInlineData const& source, NtcMaterial& material,
+    ntc::IContext* ntcContext, ntc::FileStreamWrapper& ntcFile, ntc::MemoryStreamWrapper& ntcMemory,
+    ntc::TextureSetMetadataWrapper& textureSetMetadata)
 {
     if (material.name.empty())
         material.name = "Material";
+    
+    ntc::Status ntcStatus;
+    ntc::IStream* stream = nullptr;
 
-    ntc::Status ntcStatus = ntcContext->OpenFile(ntcFileName.generic_string().c_str(), false, ntcFile.ptr());
-    if (ntcStatus == ntc::Status::FileUnavailable)
+    if (source.data)
     {
-        log::warning("Material file '%s' does not exist.", ntcFileName.generic_string().c_str());
-        return false;
+        ntcStatus = ntcContext->OpenReadOnlyMemory(source.data->buffer->data(), source.data->buffer->size(),
+            ntcMemory.ptr());
+
+        if (ntcStatus != ntc::Status::Ok)
+        {
+            log::warning("Cannot open '%s', error code = %s: %s", source.ToString().c_str(),
+                ntc::StatusToString(ntcStatus), ntc::GetLastErrorMessage());
+            return false;
+        }
+
+        stream = ntcMemory.Get();
     }
-    else if (ntcStatus != ntc::Status::Ok)
+    else
     {
-        log::warning("Cannot open '%s', error code = %s: %s", ntcFileName.generic_string().c_str(),
-            ntc::StatusToString(ntcStatus), ntc::GetLastErrorMessage());
-        return false;
+        ntcStatus = ntcContext->OpenFile(source.path.c_str(), false, ntcFile.ptr());
+        if (ntcStatus == ntc::Status::FileUnavailable)
+        {
+            log::warning("Material file '%s' does not exist.", source.path.c_str());
+            return false;
+        }
+        else if (ntcStatus != ntc::Status::Ok)
+        {
+            log::warning("Cannot open '%s', error code = %s: %s", source.path.c_str(),
+                ntc::StatusToString(ntcStatus), ntc::GetLastErrorMessage());
+            return false;
+        }
+
+        stream = ntcFile.Get();
     }
 
-    ntcStatus = ntcContext->CreateTextureSetMetadataFromStream(ntcFile, textureSetMetadata.ptr());
+    ntcStatus = ntcContext->CreateTextureSetMetadataFromStream(stream, textureSetMetadata.ptr());
     if (ntcStatus != ntc::Status::Ok)
     {
-        log::warning("Cannot load metadata for '%s', error code = %s: %s", ntcFileName.generic_string().c_str(),
+        log::warning("Cannot load metadata for '%s', error code = %s: %s", source.ToString().c_str(),
             ntc::StatusToString(ntcStatus), ntc::GetLastErrorMessage());
         return false;
     }
@@ -171,342 +390,352 @@ static bool LoadMaterialFile(fs::path const& ntcFileName, NtcMaterial& material,
     return true;
 }
 
-bool NtcMaterialLoader::TranscodeTile(const NtcMaterial& material, const nvfeedback::FeedbackTextureTileInfo& tile,
-    nvrhi::ICommandList* commandList, bool onlyAlphaMask, bool enableBlockCompression)
+bool NtcMaterialLoader::TranscodeTiles(const std::vector<TranscodeTileInfo>& tiles, nvrhi::ICommandList* commandList,
+    bool enableBlockCompression)
 {
-    struct TextureVersions
+    if (tiles.empty())
+        return true;
+
+    assert(tiles.size() <= TRANSCODE_BATCH_SIZE);
+
+    // Indices for grabbing the next available texture from the staging textures
+    uint32_t texTileColorR8Index = m_texTileColorR8Offset;
+    uint32_t texTileColorRGBAIndex = m_texTileColorRGBAOffset;
+    uint32_t texTileBlocksRGIndex = m_texTileBlocksRGOffset;
+    uint32_t texTileBlocksRGBAIndex = m_texTileBlocksRGBAOffset;
+
+    // Write all descriptors for the color textures into the decompression pass descriptor table
+    for (int descriptorIndex = 0; descriptorIndex < m_texTileBlocksRGOffset; ++descriptorIndex)
     {
-        ntc::ITextureMetadata const* metadata = nullptr;
-        ntc::BlockCompressedFormat bcFormat = ntc::BlockCompressedFormat::None;
-        nvrhi::TextureHandle color;
-        nvrhi::TextureHandle blocks;
-    };
+        nvrhi::BindingSetItem descriptor = nvrhi::BindingSetItem::Texture_UAV(
+            descriptorIndex,
+            m_texTranscodeTiles[descriptorIndex]);
+        m_graphicsDecompressionPass->WriteDescriptor(descriptor);
+    }
 
-    // The metadata
-    ntc::ITextureSetMetadata* textureSetMetadata = material.textureSetMetadata->Get();
+    // Indices which map every tile/textureIndex into the list of temporary textures
+    std::vector<uint32_t> colorTextureIndices;
+    std::vector<uint32_t> blockTextureIndices;
 
-    std::vector<TextureVersions> materialTextures;
-    int textureCount = textureSetMetadata->GetTextureCount();
+    std::array<bool, TRANSCODE_BATCH_SIZE> compressThisTexture;
 
-    // Create TextureVersions structures for every input texture
-    materialTextures.resize(textureCount);
+    commandList->beginMarker("Transcode Tiles: NTC Decompression");
 
-    // Per our fixed material channel mapping to NTC channels, the base color texture is in channels 0-3,
-    // and alpha mask is the .a component in that texture.
-    int const alphaMaskChannel = 3;
-
-    // If we only need to create the alpha mask texture, see if the material actually needs an alpha mask
-    // and if the NTC texture set has an alpha mask channel.
-
-    int alphaMaskTextureIndex = -1;
-    if (onlyAlphaMask)
+    // Phase 1 - Select the temporary tile textures from the pool and make state transitions
+    for (size_t tileIndex = 0; tileIndex < tiles.size(); ++tileIndex)
     {
-        if (material.domain != donut::engine::MaterialDomain::AlphaTested &&
-            material.domain != donut::engine::MaterialDomain::TransmissiveAlphaTested)
-            return true;
+        const TranscodeTileInfo& transcodeTile = tiles[tileIndex];
+        const NtcMaterial& material = *transcodeTile.material;
+
+        int textureCount = int(material.transcodeMapping.size());
+        assert(textureCount <= g_maxTileStagingTextures); // Maximum number of textures supported
+
+        // TODO: Does this this need to be handled without faulting?
+        assert(material.transcodeMapping.empty() == false);
 
         for (int textureIndex = 0; textureIndex < textureCount; ++textureIndex)
         {
-            ntc::ITextureMetadata const* textureMetadata = textureSetMetadata->GetTexture(textureIndex);
-            int firstChannel, numChannels;
-            textureMetadata->GetChannels(firstChannel, numChannels);
-            if (firstChannel <= alphaMaskChannel && firstChannel + numChannels > alphaMaskChannel)
+            const TextureTranscodeTask& transcodeTask = material.transcodeMapping[textureIndex];
+
+            bool const isSingleChannel = transcodeTask.numChannels == 1;
+
+            // Select the color texture
+            uint32_t colorTextureIndex = isSingleChannel ? texTileColorR8Index++ : texTileColorRGBAIndex++;
+            colorTextureIndices.push_back(colorTextureIndex);
+
+            compressThisTexture[tileIndex] = transcodeTask.bcFormat != ntc::BlockCompressedFormat::None
+                && enableBlockCompression;
+            if (compressThisTexture[tileIndex])
             {
-                alphaMaskTextureIndex = textureIndex;
-                break;
+                // Select the block texture
+                bool const isSmallBlock =
+                    (transcodeTask.bcFormat == ntc::BlockCompressedFormat::BC1) ||
+                    (transcodeTask.bcFormat == ntc::BlockCompressedFormat::BC4);
+
+                uint32_t blockTextureIndex = isSmallBlock ? texTileBlocksRGIndex++ : texTileBlocksRGBAIndex++;
+                blockTextureIndices.push_back(blockTextureIndex);
+
+                // Disable automatic UAV barriers for the block texture
+                commandList->setEnableUavBarriersForTexture(m_texTranscodeTiles[blockTextureIndex], false);
             }
+
+            // Transition to UAV
+            commandList->setTextureState(m_texTranscodeTiles[colorTextureIndex], nvrhi::AllSubresources,
+                nvrhi::ResourceStates::UnorderedAccess);
         }
-
-        if (alphaMaskTextureIndex < 0)
-            return true;
-    }
-
-    // Phase 1 - Select the temporary tile textures from the pool and write descriptors for NTC decompression
-
-    ntc::TextureSetDesc const& textureSetDesc = textureSetMetadata->GetDesc();
-
-    const uint32_t mipWidth = std::max(1, textureSetDesc.width >> tile.mip);
-    const uint32_t mipHeight = std::max(1, textureSetDesc.height >> tile.mip);
-
-    assert(textureCount <= g_maxTileStagingTextures); // Maximum number of textures supported
-
-    for (int textureIndex = 0; textureIndex < textureCount; ++textureIndex)
-    {
-        if (onlyAlphaMask && textureIndex != alphaMaskTextureIndex)
-            continue;
-
-        ntc::ITextureMetadata const* textureMetadata = textureSetMetadata->GetTexture(textureIndex);
-        bool const sRGB = textureMetadata->GetRgbColorSpace() == ntc::ColorSpace::sRGB;
-        std::string const textureName = textureMetadata->GetName();
-        std::string const materialTextureName = material.name + ":" + textureMetadata->GetName();
-
-        TextureVersions& textureVersions = materialTextures[textureIndex];
-        textureVersions.metadata = textureMetadata;
-        textureVersions.bcFormat = onlyAlphaMask
-            ? ntc::BlockCompressedFormat::BC4
-            : textureMetadata->GetBlockCompressedFormat();
-
-        // Select the color texture
-        if (onlyAlphaMask)
-        {
-            textureVersions.color = m_texTileColorR8[textureIndex];
-        }
-        else
-        {
-            if (sRGB)
-            {
-                textureVersions.color = m_texTileColorSRGBA[textureIndex];
-            }
-            else
-            {
-                textureVersions.color = m_texTileColorRGBA[textureIndex];
-            }
-        }
-
-        bool compressThisTexture = textureVersions.bcFormat != ntc::BlockCompressedFormat::None && enableBlockCompression;
-        if (compressThisTexture)
-        {
-            // Select the block texture
-            bool const isSmallBlock =
-                (textureVersions.bcFormat == ntc::BlockCompressedFormat::BC1) ||
-                (textureVersions.bcFormat == ntc::BlockCompressedFormat::BC4);
-            if (isSmallBlock)
-            {
-                textureVersions.blocks = m_texTileBlocksRG;
-            }
-            else
-            {
-                textureVersions.blocks = m_texTileBlocksRGBA;
-            }
-        }
-
-        // Transition to UAV
-        commandList->setTextureState(textureVersions.color, nvrhi::AllSubresources, nvrhi::ResourceStates::UnorderedAccess);
-
-        // Descriptors for a single mip of all textures need to be in continuous slots
-        // because the NTC decompression pass expects that layout.
-        int descriptorIndex = textureIndex;
-
-        nvrhi::BindingSetItem descriptor = nvrhi::BindingSetItem::Texture_UAV(
-            descriptorIndex,
-            textureVersions.color,
-            onlyAlphaMask
-            ? nvrhi::Format::R8_UNORM
-            : nvrhi::Format::RGBA8_UNORM // Always use non-sRGB formats so that we can create a UAV
-        );
-
-        m_graphicsDecompressionPass->WriteDescriptor(descriptor);
     }
 
     commandList->commitBarriers();
 
     // Phase 2 - Run NTC decompression
 
-    assert(material.ntcLatentsBuffer);
-    // If the data buffer has been previously created for Inference On Sample, use that.
-    m_graphicsDecompressionPass->SetInputBuffer(material.ntcLatentsBuffer);
-
-    ntc::OutputTextureDesc alphaDesc;
-    alphaDesc.firstChannel = alphaMaskChannel;
-    alphaDesc.numChannels = 1;
-    alphaDesc.descriptorIndex = 0;
-
-    ntc::Rect rectDecompress;
-    rectDecompress.left = tile.xInTexels;
-    rectDecompress.top = tile.yInTexels;
-    rectDecompress.width = std::min(tile.widthInTexels, mipWidth); // Tiles can be block sizes of 4x4 while the mip could be smaller
-    rectDecompress.height = std::min(tile.heightInTexels, mipHeight);
-
-    ntc::Point offsetDecompress;
-    offsetDecompress.x = 0;
-    offsetDecompress.y = 0;
-
-    ntc::MakeDecompressionComputePassParameters decompressionParams;
-    decompressionParams.textureSetMetadata = textureSetMetadata;
-    decompressionParams.latentStreamRange = material.latentStreamRange;
-    decompressionParams.mipLevel = tile.mip;
-    decompressionParams.firstOutputDescriptorIndex = 0;
-    decompressionParams.pOutputTextures = &alphaDesc;
-    decompressionParams.numOutputTextures = onlyAlphaMask ? 1 : 0;
-    decompressionParams.enableFP8 = true;
-    decompressionParams.pSrcRect = &rectDecompress;
-    decompressionParams.pDstOffset = &offsetDecompress;
-    ntc::ComputePassDesc decompressionPass;
-    ntc::Status ntcStatus = m_ntcContext->MakeDecompressionComputePass(decompressionParams, &decompressionPass);
-    if (ntcStatus != ntc::Status::Ok)
+    uint32_t colorTextureIndex = 0;
+    uint32_t blockTextureIndex = 0;
+    for (size_t tileIndex = 0; tileIndex < tiles.size(); ++tileIndex)
     {
-        log::warning("Failed to make a decompression pass for material '%s' mip %d, error code = %s: %s",
-            material.name.c_str(), tile.mip, ntc::StatusToString(ntcStatus), ntc::GetLastErrorMessage());
-        return false;
+        const TranscodeTileInfo& transcodeTile = tiles[tileIndex];
+        const nvfeedback::FeedbackTextureTileInfo tileInfo = transcodeTile.tileInfo;
+        const NtcMaterial& material = *transcodeTile.material;
+
+        ntc::ITextureSetMetadata* textureSetMetadata = material.textureSetMetadata->Get();
+        ntc::TextureSetDesc const& textureSetDesc = textureSetMetadata->GetDesc();
+        const uint32_t mipWidth = std::max(1, textureSetDesc.width >> tileInfo.mip);
+        const uint32_t mipHeight = std::max(1, textureSetDesc.height >> tileInfo.mip);
+        int textureCount = int(material.transcodeMapping.size());
+        assert(textureCount <= g_maxTileStagingTextures); // Maximum number of textures supported
+
+        // Make sure that the latent and weight buffers have already been created
+        assert(material.ntcLatentsBuffer);
+        assert(material.ntcWeightsBuffer);
+
+        m_graphicsDecompressionPass->SetInputBuffer(material.ntcLatentsBuffer);
+        m_graphicsDecompressionPass->SetWeightBuffer(material.ntcWeightsBuffer);
+
+        ntc::Rect rectDecompress;
+        rectDecompress.left = tileInfo.xInTexels;
+        rectDecompress.top = tileInfo.yInTexels;
+        rectDecompress.width = std::min(tileInfo.widthInTexels, mipWidth); // Tiles can be block sizes of 4x4 while the mip could be smaller
+        rectDecompress.height = std::min(tileInfo.heightInTexels, mipHeight);
+
+        ntc::Point offsetDecompress;
+        offsetDecompress.x = 0;
+        offsetDecompress.y = 0;
+        
+        std::array<ntc::OutputTextureDesc, g_maxTileStagingTextures> outputTextureDescs;
+        for (int textureIndex = 0; textureIndex < textureCount; ++textureIndex)
+        {
+            const TextureTranscodeTask& transcodeTask = material.transcodeMapping[textureIndex];
+            ntc::OutputTextureDesc& outputDesc = outputTextureDescs[textureIndex];
+            outputDesc.firstChannel = transcodeTask.firstChannel;
+            outputDesc.numChannels = transcodeTask.numChannels;
+            outputDesc.descriptorIndex = colorTextureIndices[colorTextureIndex++];
+            outputDesc.rgbColorSpace = transcodeTask.sRGB ? ntc::ColorSpace::sRGB : ntc::ColorSpace::Linear;
+            outputDesc.ditherScale = 1.f / 255.f;
+        }
+
+        ntc::MakeDecompressionComputePassParameters decompressionParams;
+        decompressionParams.textureSetMetadata = textureSetMetadata;
+        decompressionParams.latentStreamRange = material.latentStreamRange;
+        decompressionParams.mipLevel = tileInfo.mip;
+        decompressionParams.firstOutputDescriptorIndex = 0;
+        decompressionParams.pOutputTextures = outputTextureDescs.data();
+        decompressionParams.numOutputTextures = textureCount;
+        decompressionParams.weightType = ntc::InferenceWeightType(material.weightType);
+        decompressionParams.pSrcRect = &rectDecompress;
+        decompressionParams.pDstOffset = &offsetDecompress;
+        ntc::ComputePassDesc decompressionPass;
+        ntc::Status ntcStatus = m_ntcContext->MakeDecompressionComputePass(decompressionParams, &decompressionPass);
+        if (ntcStatus != ntc::Status::Ok)
+        {
+            log::warning("Failed to make a decompression pass for material '%s' mip %d, error code = %s: %s",
+                material.name.c_str(), tileInfo.mip, ntc::StatusToString(ntcStatus), ntc::GetLastErrorMessage());
+            return false;
+        }
+
+        m_graphicsDecompressionPass->ExecuteComputePass(commandList, decompressionPass);
     }
 
-    m_graphicsDecompressionPass->ExecuteComputePass(commandList, decompressionPass);
+    commandList->endMarker();
 
     // Phase 3 - Compress all mips of the color textures into BCn, where necessary
 
-    assert(textureCount == int(materialTextures.size()));
-    for (int textureIndex = 0; textureIndex < textureCount; ++textureIndex)
+    commandList->beginMarker("Transcode Tiles: BCn Compression");
+
+    // Transition textures for BCn compression
+    colorTextureIndex = 0;
+    blockTextureIndex = 0;
+    for (size_t tileIndex = 0; tileIndex < tiles.size(); ++tileIndex)
     {
-        nvrhi::ITexture* pDestTexture = nullptr;
-
-        ntc::ITextureMetadata const* textureMetadata = textureSetMetadata->GetTexture(textureIndex);
-        std::string const textureName = textureMetadata->GetName();
-
-        // Determine which slot the texture goes into based on its name
-        if (textureName == "BaseColor" || textureName == "DiffuseColor")
-            if (onlyAlphaMask)
-                pDestTexture = material.opacityTextureFeedback->GetReservedTexture();
-            else
-                pDestTexture = material.baseOrDiffuseTextureFeedback->GetReservedTexture();
-        else if (textureName == "MetallicRoughness" || textureName == "SpecularGlossiness")
-            pDestTexture = material.metalRoughOrSpecularTextureFeedback->GetReservedTexture();
-        else if (textureName == "Normal")
-            pDestTexture = material.normalTextureFeedback->GetReservedTexture();
-        else if (textureName == "Occlusion")
-            pDestTexture = material.occlusionTextureFeedback->GetReservedTexture();
-        else if (textureName == "Emissive")
-            pDestTexture = material.emissiveTextureFeedback->GetReservedTexture();
-        else if (textureName == "Transmission")
-            pDestTexture = material.transmissionTextureFeedback->GetReservedTexture();
-        else
+        const TranscodeTileInfo& transcodeTile = tiles[tileIndex];
+        const nvfeedback::FeedbackTextureTileInfo tileInfo = transcodeTile.tileInfo;
+        const NtcMaterial& material = *transcodeTile.material;
+        int textureCount = int(material.transcodeMapping.size());
+        for (int textureIndex = 0; textureIndex < textureCount; ++textureIndex)
         {
-            log::warning("Material '%s' includes unrecognized texture '%s', skipping.",
-                material.name.c_str(), textureName.c_str());
-            continue;
-        }
-
-        nvrhi::TextureSlice textureSliceDst = {};
-        textureSliceDst.x = tile.xInTexels;
-        textureSliceDst.y = tile.yInTexels;
-        textureSliceDst.z = 0;
-        textureSliceDst.mipLevel = tile.mip;
-        textureSliceDst.width = tile.widthInTexels;
-        textureSliceDst.height = tile.heightInTexels;
-        textureSliceDst.depth = 1;
-
-        TextureVersions const& textureVersions = materialTextures[textureIndex];
-        if (textureVersions.blocks)
-        {
-            float const alphaThreshold = 1.f / 255.f;
-
-            ntc::MakeBlockCompressionComputePassParameters compressionParams;
-            compressionParams.srcRect.width = std::min(tile.widthInTexels, mipWidth); // Tiles can be block sizes of 4x4 while the mip is smaller
-            compressionParams.srcRect.height = std::min(tile.heightInTexels, mipHeight);
-            compressionParams.dstFormat = textureVersions.bcFormat;
-            compressionParams.alphaThreshold = alphaThreshold;
-            compressionParams.texture = textureMetadata;
-            compressionParams.quality = textureMetadata->GetBlockCompressionQuality();
-            ntc::ComputePassDesc compressionPass;
-            ntcStatus = m_ntcContext->MakeBlockCompressionComputePass(compressionParams, &compressionPass);
-
-            if (ntcStatus != ntc::Status::Ok)
+            nvrhi::TextureHandle colorTexture = m_texTranscodeTiles[colorTextureIndices[colorTextureIndex++]];
+            if (compressThisTexture[tileIndex])
             {
-                log::warning("Failed to make a block compression pass for material '%s', error code = %s: %s",
-                    material.name.c_str(), ntc::StatusToString(ntcStatus), ntc::GetLastErrorMessage());
-                return false;
+                nvrhi::TextureHandle blockTexture = m_texTranscodeTiles[blockTextureIndices[blockTextureIndex++]];
+                commandList->setTextureState(colorTexture, nvrhi::AllSubresources, nvrhi::ResourceStates::ShaderResource);
+                commandList->setTextureState(blockTexture, nvrhi::AllSubresources, nvrhi::ResourceStates::UnorderedAccess);
             }
-
-            if (!m_graphicsBlockCompressionPass->ExecuteComputePass(commandList, compressionPass,
-                textureVersions.color, onlyAlphaMask ? nvrhi::Format::R8_UNORM : nvrhi::Format::RGBA8_UNORM,
-                0, textureVersions.blocks, 0, nullptr))
-                return false;
-
-            nvrhi::TextureSlice textureSliceSrc = {};
-            textureSliceSrc.x = 0;
-            textureSliceSrc.y = 0;
-            textureSliceSrc.z = 0;
-            textureSliceSrc.mipLevel = 0;
-            textureSliceSrc.width = (tile.widthInTexels + 3) / 4;
-            textureSliceSrc.height = (tile.heightInTexels + 3) / 4;
-            textureSliceSrc.depth = 1;
-
-            commandList->copyTexture(pDestTexture, textureSliceDst, textureVersions.blocks, textureSliceSrc);
-        }
-        else
-        {
-            nvrhi::TextureSlice textureSliceSrc = {};
-            textureSliceSrc.x = 0;
-            textureSliceSrc.y = 0;
-            textureSliceSrc.z = 0;
-            textureSliceSrc.mipLevel = 0;
-            textureSliceSrc.width = tile.widthInTexels;
-            textureSliceSrc.height = tile.heightInTexels;
-            textureSliceSrc.depth = 1;
-
-            commandList->copyTexture(pDestTexture, textureSliceDst, textureVersions.color, textureSliceSrc);
         }
     }
+    commandList->commitBarriers();
+
+    colorTextureIndex = 0;
+    blockTextureIndex = 0;
+    for (size_t tileIndex = 0; tileIndex < tiles.size(); ++tileIndex)
+    {
+        const TranscodeTileInfo& transcodeTile = tiles[tileIndex];
+        const nvfeedback::FeedbackTextureTileInfo tileInfo = transcodeTile.tileInfo;
+        const NtcMaterial& material = *transcodeTile.material;
+
+        ntc::ITextureSetMetadata* textureSetMetadata = material.textureSetMetadata->Get();
+        ntc::TextureSetDesc const& textureSetDesc = textureSetMetadata->GetDesc();
+        const uint32_t mipWidth = std::max(1, textureSetDesc.width >> tileInfo.mip);
+        const uint32_t mipHeight = std::max(1, textureSetDesc.height >> tileInfo.mip);
+        int textureCount = int(material.transcodeMapping.size());
+        assert(textureCount <= g_maxTileStagingTextures); // Maximum number of textures supported
+
+        for (int textureIndex = 0; textureIndex < textureCount; ++textureIndex)
+        {
+            const TextureTranscodeTask& transcodeTask = material.transcodeMapping[textureIndex];
+
+            nvrhi::TextureHandle colorTexture = m_texTranscodeTiles[colorTextureIndices[colorTextureIndex++]];
+
+            if (compressThisTexture[tileIndex])
+            {
+                nvrhi::TextureHandle blockTexture = m_texTranscodeTiles[blockTextureIndices[blockTextureIndex++]];
+                float const alphaThreshold = 1.f / 255.f;
+
+                ntc::MakeBlockCompressionComputePassParameters compressionParams;
+                // Tiles can be block sizes of 4x4 while the mip is smaller
+                compressionParams.srcRect.width = std::min(tileInfo.widthInTexels, mipWidth);
+                compressionParams.srcRect.height = std::min(tileInfo.heightInTexels, mipHeight);
+                compressionParams.dstFormat = transcodeTask.bcFormat;
+                compressionParams.alphaThreshold = alphaThreshold;
+                compressionParams.texture = transcodeTask.metadata;
+                compressionParams.quality = transcodeTask.metadata
+                    ? transcodeTask.metadata->GetBlockCompressionQuality()
+                    : ntc::BlockCompressionMaxQuality;
+                ntc::ComputePassDesc compressionPass;
+                ntc::Status ntcStatus = m_ntcContext->MakeBlockCompressionComputePass(compressionParams, &compressionPass);
+
+                if (ntcStatus != ntc::Status::Ok)
+                {
+                    log::warning("Failed to make a block compression pass for material '%s', error code = %s: %s",
+                        material.name.c_str(), ntc::StatusToString(ntcStatus), ntc::GetLastErrorMessage());
+                    return false;
+                }
+
+                nvrhi::Format const inputFormat = (transcodeTask.numChannels == 1)
+                    ? nvrhi::Format::R8_UNORM
+                    : nvrhi::Format::RGBA8_UNORM;
+
+                if (!m_graphicsBlockCompressionPass->ExecuteComputePass(commandList, compressionPass,
+                    colorTexture, inputFormat, 0, blockTexture, 0, nullptr))
+                    return false;
+            }
+        }
+    }
+    commandList->endMarker();
+
+    // Phase 4 - Copy tiles to the destination tiled resources
+
+    commandList->beginMarker("Transcode Tiles: Copy to Tiled Resources");
+
+    // Transition textures for copying
+    colorTextureIndex = 0;
+    blockTextureIndex = 0;
+    for (size_t tileIndex = 0; tileIndex < tiles.size(); ++tileIndex)
+    {
+        const TranscodeTileInfo& transcodeTile = tiles[tileIndex];
+        const nvfeedback::FeedbackTextureTileInfo tileInfo = transcodeTile.tileInfo;
+        const NtcMaterial& material = *transcodeTile.material;
+        int textureCount = int(material.transcodeMapping.size());
+        for (int textureIndex = 0; textureIndex < textureCount; ++textureIndex)
+        {
+            const TextureTranscodeTask& transcodeTask = material.transcodeMapping[textureIndex];
+            nvrhi::ITexture* pDestTexture = (material.*transcodeTask.pFeedbackTexture)->GetReservedTexture();
+            commandList->setTextureState(pDestTexture, nvrhi::AllSubresources, nvrhi::ResourceStates::CopyDest);
+            
+            nvrhi::TextureHandle colorTexture = m_texTranscodeTiles[colorTextureIndices[colorTextureIndex++]];
+            if (compressThisTexture[tileIndex])
+            {
+                nvrhi::TextureHandle blockTexture = m_texTranscodeTiles[blockTextureIndices[blockTextureIndex++]];
+                commandList->setTextureState(blockTexture, nvrhi::AllSubresources, nvrhi::ResourceStates::CopySource);
+            }
+            else
+            {
+                commandList->setTextureState(colorTexture, nvrhi::AllSubresources, nvrhi::ResourceStates::CopySource);
+            }
+        }
+    }
+    commandList->commitBarriers();
+
+    colorTextureIndex = 0;
+    blockTextureIndex = 0;
+    for (size_t tileIndex = 0; tileIndex < tiles.size(); ++tileIndex)
+    {
+        const TranscodeTileInfo& transcodeTile = tiles[tileIndex];
+        const nvfeedback::FeedbackTextureTileInfo tileInfo = transcodeTile.tileInfo;
+        const NtcMaterial& material = *transcodeTile.material;
+
+        ntc::ITextureSetMetadata* textureSetMetadata = material.textureSetMetadata->Get();
+        ntc::TextureSetDesc const& textureSetDesc = textureSetMetadata->GetDesc();
+        const uint32_t mipWidth = std::max(1, textureSetDesc.width >> tileInfo.mip);
+        const uint32_t mipHeight = std::max(1, textureSetDesc.height >> tileInfo.mip);
+        int textureCount = int(material.transcodeMapping.size());
+        assert(textureCount <= g_maxTileStagingTextures); // Maximum number of textures supported
+
+        for (int textureIndex = 0; textureIndex < textureCount; ++textureIndex)
+        {
+            const TextureTranscodeTask& transcodeTask = material.transcodeMapping[textureIndex];
+            nvrhi::ITexture* pDestTexture = (material.*transcodeTask.pFeedbackTexture)->GetReservedTexture();
+
+            nvrhi::TextureSlice textureSliceDst = {};
+            textureSliceDst.x = tileInfo.xInTexels;
+            textureSliceDst.y = tileInfo.yInTexels;
+            textureSliceDst.z = 0;
+            textureSliceDst.mipLevel = tileInfo.mip;
+            textureSliceDst.width = tileInfo.widthInTexels;
+            textureSliceDst.height = tileInfo.heightInTexels;
+            textureSliceDst.depth = 1;
+
+            nvrhi::TextureHandle colorTexture = m_texTranscodeTiles[colorTextureIndices[colorTextureIndex++]];
+
+            if (compressThisTexture[tileIndex])
+            {
+                nvrhi::TextureHandle blockTexture = m_texTranscodeTiles[blockTextureIndices[blockTextureIndex++]];
+
+                nvrhi::TextureSlice textureSliceSrc = {};
+                textureSliceSrc.x = 0;
+                textureSliceSrc.y = 0;
+                textureSliceSrc.z = 0;
+                textureSliceSrc.mipLevel = 0;
+                textureSliceSrc.width = (tileInfo.widthInTexels + 3) / 4;
+                textureSliceSrc.height = (tileInfo.heightInTexels + 3) / 4;
+                textureSliceSrc.depth = 1;
+
+                commandList->copyTexture(pDestTexture, textureSliceDst, blockTexture, textureSliceSrc);
+            }
+            else
+            {
+                nvrhi::TextureSlice textureSliceSrc = {};
+                textureSliceSrc.x = 0;
+                textureSliceSrc.y = 0;
+                textureSliceSrc.z = 0;
+                textureSliceSrc.mipLevel = 0;
+                textureSliceSrc.width = tileInfo.widthInTexels;
+                textureSliceSrc.height = tileInfo.heightInTexels;
+                textureSliceSrc.depth = 1;
+
+                commandList->copyTexture(pDestTexture, textureSliceDst, colorTexture, textureSliceSrc);
+            }
+        }
+    }
+    commandList->endMarker();
+
 
     return true;
 }
 
 bool NtcMaterialLoader::TranscodeMaterial(ntc::IStream* ntcFile, ntc::ITextureSetMetadata* textureSetMetadata,
-    NtcMaterial& material, nvrhi::ICommandList* commandList,
-    bool enableBlockCompression, bool onlyAlphaMask)
+    NtcMaterial& material, nvrhi::ICommandList* commandList, bool enableBlockCompression)
 {
-    struct TextureVersions
-    {
-        ntc::ITextureMetadata const* metadata = nullptr;
-        ntc::BlockCompressedFormat bcFormat = ntc::BlockCompressedFormat::None;
-        nvrhi::TextureHandle color;
-        nvrhi::TextureHandle blocks;
-        nvrhi::TextureHandle compressed;
-    };
+    if (material.transcodeMapping.empty())
+        return true;
 
-    std::vector<TextureVersions> materialTextures;
-    int textureCount = textureSetMetadata->GetTextureCount();
-
-    // Create TextureVersions structures for every input texture
-    materialTextures.resize(textureCount);
-
-    // Per our fixed material channel mapping to NTC channels, the base color texture is in channels 0-3,
-    // and alpha mask is the .a component in that texture.
-    int const alphaMaskChannel = 3;
-
-    // If we only need to create the alpha mask texture, see if the material actually needs an alpha mask
-    // and if the NTC texture set has an alpha mask channel.
-
-    int alphaMaskTextureIndex = -1;
-    if (onlyAlphaMask)
-    {
-        if (material.domain != donut::engine::MaterialDomain::AlphaTested &&
-            material.domain != donut::engine::MaterialDomain::TransmissiveAlphaTested)
-            return true;
-
-        for (int textureIndex = 0; textureIndex < textureCount; ++textureIndex)
-        {
-            ntc::ITextureMetadata const* textureMetadata = textureSetMetadata->GetTexture(textureIndex);
-            int firstChannel, numChannels;
-            textureMetadata->GetChannels(firstChannel, numChannels);
-            if (firstChannel <= alphaMaskChannel && firstChannel + numChannels > alphaMaskChannel)
-            {
-                alphaMaskTextureIndex = textureIndex;
-                break;
-            }
-        }
-
-        if (alphaMaskTextureIndex < 0)
-            return true;
-    }
+    int const textureCount = int(material.transcodeMapping.size());
 
     // Phase 1 - Create textures (color, block, BCn) and write descriptors for NTC decompression
 
     ntc::TextureSetDesc const& textureSetDesc = textureSetMetadata->GetDesc();
     for (int textureIndex = 0; textureIndex < textureCount; ++textureIndex)
     {
-        if (onlyAlphaMask && textureIndex != alphaMaskTextureIndex)
-            continue;
-
-        ntc::ITextureMetadata const* textureMetadata = textureSetMetadata->GetTexture(textureIndex);
-        bool const sRGB = textureMetadata->GetRgbColorSpace() == ntc::ColorSpace::sRGB;
-        std::string const textureName = textureMetadata->GetName();
-        std::string const materialTextureName = material.name + ":" + textureMetadata->GetName();
-
-        TextureVersions& textureVersions = materialTextures[textureIndex];
-        textureVersions.metadata = textureMetadata;
-        textureVersions.bcFormat = onlyAlphaMask
-            ? ntc::BlockCompressedFormat::BC4
-            : textureMetadata->GetBlockCompressedFormat();
+        TextureTranscodeTask& transcodeTask = material.transcodeMapping[textureIndex];
+        std::string const materialTextureName = material.name + ":" + std::string(transcodeTask.name);
 
         // Create the color texture
 
@@ -515,9 +744,9 @@ bool NtcMaterialLoader::TranscodeMaterial(ntc::IStream* ntcFile, ntc::ITextureSe
             .setWidth(textureSetDesc.width)
             .setHeight(textureSetDesc.height)
             .setMipLevels(textureSetDesc.mips)
-            .setFormat(onlyAlphaMask
+            .setFormat((transcodeTask.numChannels == 1)
                 ? nvrhi::Format::R8_UNORM
-                : sRGB
+                : transcodeTask.sRGB
                     ? nvrhi::Format::SRGBA8_UNORM
                     : nvrhi::Format::RGBA8_UNORM)
             .setDebugName(materialTextureName)
@@ -526,11 +755,11 @@ bool NtcMaterialLoader::TranscodeMaterial(ntc::IStream* ntcFile, ntc::ITextureSe
             .setInitialState(nvrhi::ResourceStates::ShaderResource)
             .setKeepInitialState(true);
 
-        textureVersions.color = m_device->createTexture(colorTextureDesc);
-        if (!textureVersions.color)
+        transcodeTask.color = m_device->createTexture(colorTextureDesc);
+        if (!transcodeTask.color)
             return false;
 
-        bool compressThisTexture = enableBlockCompression && textureVersions.bcFormat != ntc::BlockCompressedFormat::None;
+        bool compressThisTexture = enableBlockCompression && transcodeTask.bcFormat != ntc::BlockCompressedFormat::None;
 
         if (compressThisTexture)
         {
@@ -538,6 +767,7 @@ bool NtcMaterialLoader::TranscodeMaterial(ntc::IStream* ntcFile, ntc::ITextureSe
 
             nvrhi::TextureDesc compressedTextureDesc = nvrhi::TextureDesc()
                 .setDimension(nvrhi::TextureDimension::Texture2D)
+                .setFormat(transcodeTask.nvrhiBcFormat)
                 .setWidth(textureSetDesc.width)
                 .setHeight(textureSetDesc.height)
                 .setMipLevels(textureSetDesc.mips)
@@ -545,51 +775,15 @@ bool NtcMaterialLoader::TranscodeMaterial(ntc::IStream* ntcFile, ntc::ITextureSe
                 .setInitialState(nvrhi::ResourceStates::ShaderResource)
                 .setKeepInitialState(true);
 
-            switch(textureVersions.bcFormat)
-            {
-                case ntc::BlockCompressedFormat::BC1:
-                    compressedTextureDesc.setFormat(sRGB ? nvrhi::Format::BC1_UNORM_SRGB : nvrhi::Format::BC1_UNORM);
-                    break;
-                case ntc::BlockCompressedFormat::BC2:
-                    compressedTextureDesc.setFormat(sRGB ? nvrhi::Format::BC2_UNORM_SRGB : nvrhi::Format::BC2_UNORM);
-                    break;
-                case ntc::BlockCompressedFormat::BC3:
-                    compressedTextureDesc.setFormat(sRGB ? nvrhi::Format::BC3_UNORM_SRGB : nvrhi::Format::BC3_UNORM);
-                    break;
-                case ntc::BlockCompressedFormat::BC4:
-                    compressedTextureDesc.setFormat(nvrhi::Format::BC4_UNORM);
-                    break;
-                case ntc::BlockCompressedFormat::BC5:
-                    compressedTextureDesc.setFormat(nvrhi::Format::BC5_UNORM);
-                    break;
-                case ntc::BlockCompressedFormat::BC6:
-                    compressedTextureDesc.setFormat(nvrhi::Format::BC6H_UFLOAT);
-                    break;
-                case ntc::BlockCompressedFormat::BC7:
-                    compressedTextureDesc.setFormat(sRGB ? nvrhi::Format::BC7_UNORM_SRGB : nvrhi::Format::BC7_UNORM);
-                    break;
-                default:
-                    log::warning("Material '%s' texture '%s': pixel format %s is recognized as block compressed, "
-                        "but it's not BC1-7.", material.name.c_str(), textureName.c_str(),
-                        ntc::BlockCompressedFormatToString(textureVersions.bcFormat));
-                    compressThisTexture = false;
-            }
+            transcodeTask.compressed = m_device->createTexture(compressedTextureDesc);
+            if (!transcodeTask.compressed)
+                return false;
 
-            if (compressThisTexture)
-            {
-                textureVersions.compressed = m_device->createTexture(compressedTextureDesc);
-                if (!textureVersions.compressed)
-                    return false;
-            }
-        }
-
-        if (compressThisTexture)
-        {
             // Create the block texture
 
             bool const isSmallBlock =
-                (textureVersions.bcFormat == ntc::BlockCompressedFormat::BC1) ||
-                (textureVersions.bcFormat == ntc::BlockCompressedFormat::BC4);
+                (transcodeTask.bcFormat == ntc::BlockCompressedFormat::BC1) ||
+                (transcodeTask.bcFormat == ntc::BlockCompressedFormat::BC4);
 
             nvrhi::TextureDesc blockTextureDesc = nvrhi::TextureDesc()
                 .setDimension(nvrhi::TextureDimension::Texture2D)
@@ -601,22 +795,23 @@ bool NtcMaterialLoader::TranscodeMaterial(ntc::IStream* ntcFile, ntc::ITextureSe
                 .setInitialState(nvrhi::ResourceStates::UnorderedAccess)
                 .setKeepInitialState(true);
 
-            textureVersions.blocks = m_device->createTexture(blockTextureDesc);
-            if (!textureVersions.blocks)
+            transcodeTask.blocks = m_device->createTexture(blockTextureDesc);
+            if (!transcodeTask.blocks)
                 return false;
         }
         
+        // Descriptors for all mip levels of one texture are packed together
+        transcodeTask.mipZeroDescriptor = textureSetDesc.mips * textureIndex;
+
         // Write descriptors for all mips of the color texture
         for (int mipLevel = 0; mipLevel < textureSetDesc.mips; ++mipLevel)
         {
-            // Descriptors for a single mip of all textures need to be in continuous slots
-            // because the NTC decompression pass expects that layout.
-            int descriptorIndex = mipLevel * textureCount + textureIndex;
+            int descriptorIndex = transcodeTask.mipZeroDescriptor + mipLevel;
 
             nvrhi::BindingSetItem descriptor = nvrhi::BindingSetItem::Texture_UAV(
                 descriptorIndex,
-                textureVersions.color,
-                onlyAlphaMask
+                transcodeTask.color,
+                (transcodeTask.numChannels == 1)
                     ? nvrhi::Format::R8_UNORM
                     : nvrhi::Format::RGBA8_UNORM, // Always use non-sRGB formats so that we can create a UAV
                 nvrhi::TextureSubresourceSet().setBaseMipLevel(mipLevel));
@@ -628,40 +823,19 @@ bool NtcMaterialLoader::TranscodeMaterial(ntc::IStream* ntcFile, ntc::ITextureSe
         // through a descriptor table. Note that there is no need to transition it back to SRV after decompression
         // because the next operations are using regular binding sets. There is also no need for commitBarriers()
         // because that's called by the decompression dispatch call.
-        commandList->setTextureState(textureVersions.color, nvrhi::AllSubresources,
+        commandList->setTextureState(transcodeTask.color, nvrhi::AllSubresources,
             nvrhi::ResourceStates::UnorderedAccess);
         
         // Create a LoadedTexture object to attach the texture to the material
         std::shared_ptr<engine::LoadedTexture> loadedTexture = std::make_shared<engine::LoadedTexture>();
-        loadedTexture->texture = compressThisTexture ? textureVersions.compressed : textureVersions.color;
+        loadedTexture->texture = compressThisTexture ? transcodeTask.compressed : transcodeTask.color;
 
         // Count the final texture size in the material's memory consumption metric
         size_t const textureMemorySize = m_device->getTextureMemoryRequirements(loadedTexture->texture).size;
         material.transcodedMemorySize += textureMemorySize;
         
-        // Determine which slot the texture goes into based on its name
-        if (textureName == "BaseColor" || textureName == "DiffuseColor")
-        {
-            if (onlyAlphaMask)
-                material.opacityTexture = loadedTexture;
-            else
-                material.baseOrDiffuseTexture = loadedTexture;
-        }
-        else if (textureName == "MetallicRoughness" || textureName == "SpecularGlossiness")
-            material.metalRoughOrSpecularTexture = loadedTexture;
-        else if (textureName == "Normal")
-            material.normalTexture = loadedTexture;
-        else if (textureName == "Occlusion")
-            material.occlusionTexture = loadedTexture;
-        else if (textureName == "Emissive")
-            material.emissiveTexture = loadedTexture;
-        else if (textureName == "Transmission")
-            material.transmissionTexture = loadedTexture;
-        else
-        {
-            log::warning("Material '%s' includes unrecognized texture '%s', skipping.",
-                material.name.c_str(), textureName.c_str());
-        }
+        // Bind the created texture object to the material texture slot
+        material.*transcodeTask.pMaterialTexture = loadedTexture;
     }
 
     // Submit the texture transitions performed above via setTextureState(...) to the command list.
@@ -671,33 +845,40 @@ bool NtcMaterialLoader::TranscodeMaterial(ntc::IStream* ntcFile, ntc::ITextureSe
 
     // Phase 2 - Run NTC decompression
 
-    if (material.ntcLatentsBuffer)
+    // Make sure that the latent and weight buffers have already been created
+    assert(material.ntcLatentsBuffer);
+    assert(material.ntcWeightsBuffer);
+
+    m_graphicsDecompressionPass->SetInputBuffer(material.ntcLatentsBuffer);
+    m_graphicsDecompressionPass->SetWeightBuffer(material.ntcWeightsBuffer);
+
+    // Pre-fill the OutputTextureDesc array for decoding of all mip levels
+    std::vector<ntc::OutputTextureDesc> outputTextureDescs;
+    outputTextureDescs.resize(textureCount);
+    for (int textureIndex = 0; textureIndex < textureCount; ++textureIndex)
     {
-        // If the data buffer has been previously created for Inference On Sample, use that.
-        m_graphicsDecompressionPass->SetInputBuffer(material.ntcLatentsBuffer);
+        TextureTranscodeTask& transcodeTask = material.transcodeMapping[textureIndex];
+        ntc::OutputTextureDesc& outputDesc = outputTextureDescs[textureIndex];
+        outputDesc.firstChannel = transcodeTask.firstChannel;
+        outputDesc.numChannels = transcodeTask.numChannels;
+        outputDesc.descriptorIndex = transcodeTask.mipZeroDescriptor;
+        outputDesc.rgbColorSpace = transcodeTask.sRGB ? ntc::ColorSpace::sRGB : ntc::ColorSpace::Linear;
+        outputDesc.ditherScale = 1.f / 255.f;
     }
-    else
-        m_graphicsDecompressionPass->SetInputData(commandList, ntcFile, material.latentStreamRange);
 
     for (int mipLevel = 0; mipLevel < textureSetDesc.mips; ++mipLevel)
     {
-        // alphaDesc is used when we're decompressing only the alpha channel, in which case it describes
-        // which channel to process and where to put the result.
-        ntc::OutputTextureDesc alphaDesc;
-        alphaDesc.firstChannel = alphaMaskChannel;
-        alphaDesc.numChannels = 1;
-        alphaDesc.descriptorIndex = alphaMaskTextureIndex;
-
         // Obtain the description of the decompression pass from LibNTC.
         // The description includes the shader code, weights, and constants.
         ntc::MakeDecompressionComputePassParameters decompressionParams;
         decompressionParams.textureSetMetadata = textureSetMetadata;
         decompressionParams.latentStreamRange = material.latentStreamRange;
         decompressionParams.mipLevel = mipLevel;
-        decompressionParams.firstOutputDescriptorIndex = mipLevel * textureCount;
-        decompressionParams.pOutputTextures = &alphaDesc;
-        decompressionParams.numOutputTextures = onlyAlphaMask ? 1 : 0;
-        decompressionParams.enableFP8 = true;
+        // This index is added to descriptorIndex from the outputTextureDescs array, so the indexing math works out
+        decompressionParams.firstOutputDescriptorIndex = mipLevel;
+        decompressionParams.pOutputTextures = outputTextureDescs.data();
+        decompressionParams.numOutputTextures = int(outputTextureDescs.size());
+        decompressionParams.weightType = ntc::InferenceWeightType(material.weightType);
         ntc::ComputePassDesc decompressionPass;
         ntc::Status ntcStatus = m_ntcContext->MakeDecompressionComputePass(decompressionParams, &decompressionPass);
         if (ntcStatus != ntc::Status::Ok)
@@ -714,14 +895,10 @@ bool NtcMaterialLoader::TranscodeMaterial(ntc::IStream* ntcFile, ntc::ITextureSe
 
     // Phase 3 - Compress all mips of the color textures into BCn, where necessary
 
-    assert(textureCount == int(materialTextures.size()));
-    for (int textureIndex = 0; textureIndex < textureCount; ++textureIndex)
+    for (TextureTranscodeTask const& transcodeTask : material.transcodeMapping)
     {
-        TextureVersions const& textureVersions = materialTextures[textureIndex];
-        if (!textureVersions.compressed)
+        if (!transcodeTask.compressed)
             continue;
-
-        ntc::ITextureMetadata const* textureMetadata = textureSetMetadata->GetTexture(textureIndex);
 
         float const alphaThreshold = 1.f / 255.f;
         
@@ -734,10 +911,12 @@ bool NtcMaterialLoader::TranscodeMaterial(ntc::IStream* ntcFile, ntc::ITextureSe
             ntc::MakeBlockCompressionComputePassParameters compressionParams;
             compressionParams.srcRect.width = mipWidth;
             compressionParams.srcRect.height = mipHeight;
-            compressionParams.dstFormat = textureVersions.bcFormat;
+            compressionParams.dstFormat = transcodeTask.bcFormat;
             compressionParams.alphaThreshold = alphaThreshold;
-            compressionParams.texture = textureMetadata;
-            compressionParams.quality = textureMetadata->GetBlockCompressionQuality();
+            compressionParams.texture = transcodeTask.metadata;
+            compressionParams.quality = transcodeTask.metadata
+                ? transcodeTask.metadata->GetBlockCompressionQuality()
+                : ntc::BlockCompressionMaxQuality;
             ntc::ComputePassDesc compressionPass;
             ntc::Status ntcStatus = m_ntcContext->MakeBlockCompressionComputePass(compressionParams, &compressionPass);
 
@@ -748,21 +927,35 @@ bool NtcMaterialLoader::TranscodeMaterial(ntc::IStream* ntcFile, ntc::ITextureSe
                 return false;
             }
 
+            nvrhi::Format const inputFormat = (transcodeTask.numChannels == 1)
+                ? nvrhi::Format::R8_UNORM
+                : nvrhi::Format::RGBA8_UNORM;
+
             // Execute the compute pass to compress the texture.
             // Note: ExecuteComputePass is application code (not LibNTC) and it caches PSOs based on shader code pointers.
             if (!m_graphicsBlockCompressionPass->ExecuteComputePass(commandList, compressionPass,
-                textureVersions.color, onlyAlphaMask ? nvrhi::Format::R8_UNORM : nvrhi::Format::RGBA8_UNORM,
-                mipLevel, textureVersions.blocks, 0, nullptr))
+                transcodeTask.color, inputFormat, mipLevel, transcodeTask.blocks, 0, nullptr))
                 return false;
             
             int const mipWidthBlocks = (mipWidth + 3) / 4;
             int const mipHeightBlocks = (mipHeight + 3) / 4;
 
-            commandList->copyTexture(textureVersions.compressed, nvrhi::TextureSlice().setMipLevel(mipLevel),
-                textureVersions.blocks, nvrhi::TextureSlice().setWidth(mipWidthBlocks).setHeight(mipHeightBlocks));
+            commandList->copyTexture(transcodeTask.compressed, nvrhi::TextureSlice().setMipLevel(mipLevel),
+                transcodeTask.blocks, nvrhi::TextureSlice().setWidth(mipWidthBlocks).setHeight(mipHeightBlocks));
         }
     }
-    
+
+    // Cleanup - release the intermediate textures
+
+    for (TextureTranscodeTask& transcodeTask : material.transcodeMapping)
+    {
+        transcodeTask.ReleaseTextures();
+    }
+
+    // Clear the binding set caches to avoid storing binding sets for every texture after on-load transcoding
+    m_graphicsBlockCompressionPass->ClearBindingSetCache();
+    m_graphicsDecompressionPass->ClearBindingSetCache();
+
     // We use custom texture packing that puts metalness and roughness into one NTC "texture"
     // with Metalness in R channel and Roughness in G channel.
     // Note: Only set this flag when Inference on Load is active, otherwise we get rendering corruption
@@ -770,6 +963,81 @@ bool NtcMaterialLoader::TranscodeMaterial(ntc::IStream* ntcFile, ntc::ITextureSe
     material.metalnessInRedChannel = true;
 
     return true;
+}
+
+static void GetNtcDataSourceAndChannelMap(NtcMaterial const& material,
+    donut::engine::FilePathOrInlineData& ntcData, MaterialChannelMap& channelMap)
+{
+    // Initialize the channel shuffle map with default texture values.
+    // Most textures have "1.0" as the no-effect value, except for the normal map, for which it is (0.5, 0.5, 1.0)
+    // See also DefaultMaterialTextures() in <donut/shaders/scene_material.hlsli>
+    channelMap.swizzle.fill(ntc::ShuffleSource::Constant(1.f));
+    channelMap.swizzle[CHANNEL_NORMAL + 0] = ntc::ShuffleSource::Constant(0.5f);
+    channelMap.swizzle[CHANNEL_NORMAL + 1] = ntc::ShuffleSource::Constant(0.5f);
+
+    auto processMaterialTexture = [&ntcData, &channelMap, &material](std::shared_ptr<donut::engine::LoadedTexture> const& texture,
+        int ch0, int ch1 = -1, int ch2 = -1, int ch3 = -1)
+    {
+        int destChannels[4] = { ch0, ch1, ch2, ch3 };
+        if (!texture)
+            return;
+        
+        // Find a swizzle option that refers to an NTC file or buffer.
+        // Currently, there are no GLTF models that have multiple options, but there might be ones
+        // that have e.g. NTC and EXR.
+        for (auto const& swizzleOption : texture->swizzleOptions)
+        {
+            bool const isNtcFile = string_utils::ends_with(swizzleOption.source.path, ".ntc");
+            bool const isNtcBuffer = swizzleOption.source.data &&
+                swizzleOption.source.data->mimeType == "image/vnd-nvidia.ntc";
+
+            if (!isNtcFile && !isNtcBuffer)
+                continue;
+
+            if (!ntcData)
+            {
+                ntcData = swizzleOption.source;
+            }
+            else if (ntcData != swizzleOption.source)
+            {
+                log::warning("Material %s uses different NTC sources for different textures, which is not supported.",
+                    material.name.c_str());
+            }
+
+            for (int ch = 0; ch < 4; ++ch)
+            {
+                if (ch < swizzleOption.numChannels)
+                {
+                    // Copy the source channel index, but preserve -1 so that mappings containing that could be merged
+                    int sourceChannel = swizzleOption.channels[ch];
+                    int destChannel = destChannels[ch];
+                    if (sourceChannel >= 0 && destChannel >= 0)
+                    {
+                        channelMap.swizzle[destChannel] = ntc::ShuffleSource::Channel(sourceChannel);
+                    }
+                }
+            }
+
+        }
+    };
+
+    processMaterialTexture(material.baseOrDiffuseTexture,
+        CHANNEL_BASE_COLOR, CHANNEL_BASE_COLOR+1, CHANNEL_BASE_COLOR+2, CHANNEL_OPACITY);
+
+    processMaterialTexture(material.metalRoughOrSpecularTexture,
+        CHANNEL_OCCLUSION, CHANNEL_ROUGHNESS, CHANNEL_METALNESS);
+
+    processMaterialTexture(material.occlusionTexture,
+        CHANNEL_OCCLUSION);
+
+    processMaterialTexture(material.normalTexture,
+        CHANNEL_NORMAL, CHANNEL_NORMAL+1, CHANNEL_NORMAL+2);
+
+    processMaterialTexture(material.emissiveTexture,
+        CHANNEL_EMISSIVE, CHANNEL_EMISSIVE+1, CHANNEL_EMISSIVE+2);
+
+    processMaterialTexture(material.transmissionTexture,
+        CHANNEL_TRANSMISSION);
 }
 
 bool NtcMaterialLoader::PrepareMaterialForInferenceOnSample(ntc::IStream* ntcFile, 
@@ -796,7 +1064,8 @@ bool NtcMaterialLoader::PrepareMaterialForInferenceOnSample(ntc::IStream* ntcFil
 
     void const* weightData = nullptr;
     size_t weightSize = 0;
-    ntcStatus = textureSetMetadata->GetInferenceWeights(weightType, &weightData, &weightSize);
+    size_t convertedWeightSize = 0;
+    ntcStatus = textureSetMetadata->GetInferenceWeights(weightType, &weightData, &weightSize, &convertedWeightSize);
 
     if (ntcStatus != ntc::Status::Ok)
     {
@@ -816,8 +1085,9 @@ bool NtcMaterialLoader::PrepareMaterialForInferenceOnSample(ntc::IStream* ntcFil
         return false;
 
     nvrhi::BufferDesc weightBufferDesc = nvrhi::BufferDesc()
-        .setByteSize(weightSize)
+        .setByteSize(convertedWeightSize ? convertedWeightSize : weightSize)
         .setCanHaveRawViews(true)
+        .setCanHaveUAVs(true)
         .setInitialState(nvrhi::ResourceStates::ShaderResource)
         .setKeepInitialState(true)
         .setDebugName(material.name + " weights");
@@ -846,29 +1116,50 @@ bool NtcMaterialLoader::PrepareMaterialForInferenceOnSample(ntc::IStream* ntcFil
     }
 
     commandList->writeBuffer(material.ntcLatentsBuffer, latentData.data(), latentData.size());
-    commandList->writeBuffer(material.ntcWeightsBuffer, weightData, weightSize);
     commandList->writeBuffer(material.ntcConstantBuffer, &inferenceData.constants,
         sizeof(inferenceData.constants));
 
-    int const textureCount = textureSetMetadata->GetTextureCount();
-    for (int textureIndex = 0; textureIndex < textureCount; ++textureIndex)
+    if (convertedWeightSize != 0)
     {
-        ntc::ITextureMetadata const* textureMetadata = textureSetMetadata->GetTexture(textureIndex);
-        std::string const textureName = textureMetadata->GetName();
+        assert(m_weightUploadBuffer->getDesc().byteSize >= weightSize);
+        commandList->writeBuffer(m_weightUploadBuffer, weightData, weightSize);
 
-        if (textureName == "BaseColor" || textureName == "DiffuseColor")
-            material.baseOrDiffuseTexture = m_dummyTexture;
-        else if (textureName == "MetallicRoughness" || textureName == "SpecularGlossiness")
-            material.metalRoughOrSpecularTexture = m_dummyTexture;
-        else if (textureName == "Normal")
-            material.normalTexture = m_dummyTexture;
-        else if (textureName == "Occlusion")
-            material.occlusionTexture = m_dummyTexture;
-        else if (textureName == "Emissive")
-            material.emissiveTexture = m_dummyTexture;
-        else if (textureName == "Transmission")
-            material.transmissionTexture = m_dummyTexture;
+        commandList->setBufferState(m_weightUploadBuffer, nvrhi::ResourceStates::ShaderResource);
+        commandList->setBufferState(material.ntcWeightsBuffer, nvrhi::ResourceStates::UnorderedAccess);
+        commandList->commitBarriers();
+
+        bool const isVulkan = m_device->getGraphicsAPI() == nvrhi::GraphicsAPI::VULKAN;
+        nvrhi::ObjectType const commandListType = isVulkan
+            ? nvrhi::ObjectTypes::VK_CommandBuffer
+            : nvrhi::ObjectTypes::D3D12_GraphicsCommandList;
+        nvrhi::ObjectType const bufferType = isVulkan
+            ? nvrhi::ObjectTypes::VK_Buffer
+            : nvrhi::ObjectTypes::D3D12_Resource;
+
+        void* nativeCommandList = commandList->getNativeObject(commandListType);
+        void* nativeSrcBuffer = m_weightUploadBuffer->getNativeObject(bufferType);
+        void* nativeDstBuffer = material.ntcWeightsBuffer->getNativeObject(bufferType);
+
+        textureSetMetadata->ConvertInferenceWeights(weightType, nativeCommandList,
+            nativeSrcBuffer, 0, nativeDstBuffer, 0);
     }
+    else
+    {
+        commandList->writeBuffer(material.ntcWeightsBuffer, weightData, weightSize);
+    }
+
+    if (material.baseOrDiffuseTexture)
+        material.baseOrDiffuseTexture->texture = m_dummyTexture->texture;
+    if (material.metalRoughOrSpecularTexture)
+        material.metalRoughOrSpecularTexture->texture = m_dummyTexture->texture;
+    if (material.normalTexture)
+        material.normalTexture->texture = m_dummyTexture->texture;
+    if (material.occlusionTexture)
+        material.occlusionTexture->texture = m_dummyTexture->texture;
+    if (material.emissiveTexture)
+        material.emissiveTexture->texture = m_dummyTexture->texture;
+    if (material.transmissionTexture)
+        material.transmissionTexture->texture = m_dummyTexture->texture;
 
     material.ntcMemorySize =
         m_device->getBufferMemoryRequirements(material.ntcConstantBuffer).size + 
@@ -876,92 +1167,38 @@ bool NtcMaterialLoader::PrepareMaterialForInferenceOnSample(ntc::IStream* ntcFil
         m_device->getBufferMemoryRequirements(material.ntcLatentsBuffer).size;
     
     material.weightType = int(weightType);
+    ++m_weightTypeHistogram[int(weightType)];
 
     return true;
 }
 
 bool NtcMaterialLoader::PrepareFeedbackMaterial(std::shared_ptr<nvfeedback::FeedbackManager> feedbackManager,
-    ntc::ITextureSetMetadata* textureSetMetadata, NtcMaterial& material, nvrhi::ICommandList* commandList, bool enableBlockCompression)
+    ntc::ITextureSetMetadata* textureSetMetadata, NtcMaterial& material, bool enableBlockCompression)
 {
-
     ntc::TextureSetDesc const& textureSetDesc = textureSetMetadata->GetDesc();
-    int const textureCount = textureSetMetadata->GetTextureCount();
-    for (int textureIndex = 0; textureIndex < textureCount; ++textureIndex)
+    for (TextureTranscodeTask& transcodeTask : material.transcodeMapping)
     {
-        ntc::ITextureMetadata const* textureMetadata = textureSetMetadata->GetTexture(textureIndex);
-        bool const sRGB = textureMetadata->GetRgbColorSpace() == ntc::ColorSpace::sRGB;
-        ntc::BlockCompressedFormat const targetFormat = textureMetadata->GetBlockCompressedFormat();
-        std::string const textureName = textureMetadata->GetName();
-        std::string const materialTextureName = material.name + ":" + textureMetadata->GetName();
-
-        nvrhi::TextureDesc compressedTextureDesc = nvrhi::TextureDesc()
+         nvrhi::TextureDesc compressedTextureDesc = nvrhi::TextureDesc()
             .setDimension(nvrhi::TextureDimension::Texture2D)
             .setWidth(textureSetDesc.width)
             .setHeight(textureSetDesc.height)
             .setMipLevels(textureSetDesc.mips)
-            .setDebugName(materialTextureName)
+            .setDebugName(transcodeTask.name)
             .setInitialState(nvrhi::ResourceStates::ShaderResource)
             .setKeepInitialState(true);
 
         if (enableBlockCompression)
         {
-            switch (targetFormat)
-            {
-            case ntc::BlockCompressedFormat::BC1:
-                compressedTextureDesc.setFormat(sRGB ? nvrhi::Format::BC1_UNORM_SRGB : nvrhi::Format::BC1_UNORM);
-                break;
-            case ntc::BlockCompressedFormat::BC2:
-                compressedTextureDesc.setFormat(sRGB ? nvrhi::Format::BC2_UNORM_SRGB : nvrhi::Format::BC2_UNORM);
-                break;
-            case ntc::BlockCompressedFormat::BC3:
-                compressedTextureDesc.setFormat(sRGB ? nvrhi::Format::BC3_UNORM_SRGB : nvrhi::Format::BC3_UNORM);
-                break;
-            case ntc::BlockCompressedFormat::BC4:
-                compressedTextureDesc.setFormat(nvrhi::Format::BC4_UNORM);
-                break;
-            case ntc::BlockCompressedFormat::BC5:
-                compressedTextureDesc.setFormat(nvrhi::Format::BC5_UNORM);
-                break;
-            case ntc::BlockCompressedFormat::BC6:
-                compressedTextureDesc.setFormat(nvrhi::Format::BC6H_UFLOAT);
-                break;
-            case ntc::BlockCompressedFormat::BC7:
-                compressedTextureDesc.setFormat(sRGB ? nvrhi::Format::BC7_UNORM_SRGB : nvrhi::Format::BC7_UNORM);
-                break;
-            default:
-                log::error("Material '%s' texture '%s': pixel format %s is recognized as block compressed, "
-                    "but it's not BC1-7.", material.name.c_str(), textureName.c_str(),
-                    ntc::BlockCompressedFormatToString(targetFormat));
-            }
+            compressedTextureDesc.setFormat(transcodeTask.nvrhiBcFormat);
         }
         else
         {
-            compressedTextureDesc.setFormat(sRGB ? nvrhi::Format::SRGBA8_UNORM : nvrhi::Format::RGBA8_UNORM);
+            compressedTextureDesc.setFormat(transcodeTask.sRGB ? nvrhi::Format::SRGBA8_UNORM : nvrhi::Format::RGBA8_UNORM);
         }
 
         nvrhi::RefCountPtr<nvfeedback::FeedbackTexture> feedbackTexture;
         feedbackManager->CreateTexture(compressedTextureDesc, &feedbackTexture);
-
-        // Determine which slot the texture goes into based on its name
-        if (textureName == "BaseColor" || textureName == "DiffuseColor")
-            material.baseOrDiffuseTextureFeedback = feedbackTexture;
-        else if (textureName == "MetallicRoughness" || textureName == "SpecularGlossiness")
-            material.metalRoughOrSpecularTextureFeedback = feedbackTexture;
-        else if (textureName == "Normal")
-            material.normalTextureFeedback = feedbackTexture;
-        else if (textureName == "Occlusion")
-            material.occlusionTextureFeedback = feedbackTexture;
-        else if (textureName == "Emissive")
-            material.emissiveTextureFeedback = feedbackTexture;
-        else if (textureName == "Transmission")
-            material.transmissionTextureFeedback = feedbackTexture;
-        else
-        {
-            log::warning("Material '%s' includes unrecognized texture '%s', skipping.",
-                material.name.c_str(), textureName.c_str());
-        }
-
-        material.feedbackTextures.push_back(feedbackTexture);
+        material.*transcodeTask.pFeedbackTexture = feedbackTexture;
     }
 
     return true;
@@ -977,63 +1214,34 @@ bool NtcMaterialLoader::LoadMaterialsForScene(donut::engine::Scene& scene, std::
     uint64_t totalFileSize = 0;
     uint64_t totalPixels = 0;
     int materialCount = 0;
+    m_weightTypeHistogram.fill(0);
 
     std::vector<std::shared_ptr<engine::Material>> materials;
     for (std::shared_ptr<engine::Material> const& material : scene.GetSceneGraph()->GetMaterials())
         materials.push_back(material);
 
-    std::unordered_map<std::string, std::vector<std::string>> materialToNtcMappings; // modelFileName -> [ntcFileName]
-    std::unordered_map<fs::path, std::shared_ptr<NtcMaterial>> ntcMaterialCache; // ntcFileName -> NtcMaterial
+    std::unordered_map<std::string, std::shared_ptr<NtcMaterial>> ntcMaterialCache; // ntcData.ToString() -> NtcMaterial
 
     for (std::shared_ptr<engine::Material> const& material : materials)
     {
-        NtcMaterial* ntcMaterial = static_cast<NtcMaterial*>(material.get());
+        std::shared_ptr<NtcMaterial> ntcMaterial = std::static_pointer_cast<NtcMaterial>(material);
 
         fs::path modelFileName = material->modelFileName;
         fs::path currentMaterialDir = materialDir.empty() ? modelFileName.parent_path() : materialDir;
 
-        auto mappingIterator = materialToNtcMappings.find(material->modelFileName);
-        if (mappingIterator == materialToNtcMappings.end())
-        {
-            std::vector<std::string> mapping;
+        // Find a single NTC file that contains channels for all textures for this material.
+        // In a general case, there may be multiple different files used in a single material,
+        // but our GLTF preparation script only uses one, and we only support one in this renderer.
+        // Also derive the channel mapping: where to source the channels for albedo, roughness, etc.
+        donut::engine::FilePathOrInlineData ntcData;
+        MaterialChannelMap channelMap;
+        GetNtcDataSourceAndChannelMap(*ntcMaterial, ntcData, channelMap);
 
-            fs::path mappingFileName = currentMaterialDir / (modelFileName.stem().generic_string() + ".ntc-materials.txt");
-            std::ifstream mappingFile(mappingFileName.generic_string());
-            if (mappingFile)
-            {
-                std::string line;
-                while (std::getline(mappingFile, line))
-                {
-                    donut::string_utils::trim(line);
-                    mapping.push_back(line);
-                }
-            }
+        // No NTC data found, skip the material
+        if (!ntcData)
+            continue;
 
-            auto [newIterator, inserted] = materialToNtcMappings.insert_or_assign(material->modelFileName, mapping);
-            mappingIterator = newIterator;
-        }
-
-        std::vector<std::string> const& materialMapping = mappingIterator->second;
-        fs::path ntcFileName;
-        if (materialMapping.size() > material->materialIndexInModel)
-        {
-            std::string const& mappingEntry = materialMapping[material->materialIndexInModel];
-            if (!mappingEntry.empty() && mappingEntry != "*")
-            {
-                ntcFileName = currentMaterialDir / mappingEntry;
-            }
-            else
-            {
-                // No NTC file specified in the mapping, skip.
-                continue;
-            }
-        }
-        else
-        {
-            ntcFileName = currentMaterialDir / (material->name + ".ntc");
-        }
-
-        auto cacheIterator = ntcMaterialCache.find(ntcFileName);
+        auto cacheIterator = ntcMaterialCache.find(ntcData.ToString());
         if (cacheIterator != ntcMaterialCache.end())
         {
             auto previouslyLoadedMaterial = cacheIterator->second;
@@ -1043,25 +1251,46 @@ bool NtcMaterialLoader::LoadMaterialsForScene(donut::engine::Scene& scene, std::
             ntcMaterial->ntcConstantBuffer = previouslyLoadedMaterial->ntcConstantBuffer;
             ntcMaterial->ntcWeightsBuffer = previouslyLoadedMaterial->ntcWeightsBuffer;
             ntcMaterial->ntcLatentsBuffer = previouslyLoadedMaterial->ntcLatentsBuffer;
+            ntcMaterial->latentStreamRange = previouslyLoadedMaterial->latentStreamRange;
             ntcMaterial->networkVersion = previouslyLoadedMaterial->networkVersion;
+            ntcMaterial->weightType = previouslyLoadedMaterial->weightType;
             ntcMaterial->baseOrDiffuseTexture = previouslyLoadedMaterial->baseOrDiffuseTexture;
             ntcMaterial->metalRoughOrSpecularTexture = previouslyLoadedMaterial->metalRoughOrSpecularTexture;
             ntcMaterial->normalTexture = previouslyLoadedMaterial->normalTexture;
             ntcMaterial->emissiveTexture = previouslyLoadedMaterial->emissiveTexture;
             ntcMaterial->occlusionTexture = previouslyLoadedMaterial->occlusionTexture;
             ntcMaterial->transmissionTexture = previouslyLoadedMaterial->transmissionTexture;
+            ntcMaterial->opacityTexture = previouslyLoadedMaterial->opacityTexture;
             ntcMaterial->metalnessInRedChannel = previouslyLoadedMaterial->metalnessInRedChannel;
+            ntcMaterial->baseOrDiffuseTextureFeedback = previouslyLoadedMaterial->baseOrDiffuseTextureFeedback;
+            ntcMaterial->metalRoughOrSpecularTextureFeedback = previouslyLoadedMaterial->metalRoughOrSpecularTextureFeedback;
+            ntcMaterial->normalTextureFeedback = previouslyLoadedMaterial->normalTextureFeedback;
+            ntcMaterial->emissiveTextureFeedback = previouslyLoadedMaterial->emissiveTextureFeedback;
+            ntcMaterial->occlusionTextureFeedback = previouslyLoadedMaterial->occlusionTextureFeedback;
+            ntcMaterial->transmissionTextureFeedback = previouslyLoadedMaterial->transmissionTextureFeedback;
+            ntcMaterial->opacityTextureFeedback = previouslyLoadedMaterial->opacityTextureFeedback;
+            ntcMaterial->textureSetMetadata = previouslyLoadedMaterial->textureSetMetadata;
+            ntcMaterial->transcodeMapping = previouslyLoadedMaterial->transcodeMapping;
 
             continue;
         }
 
-        ntc::FileStreamWrapper ntcFile(m_ntcContext);
-        ntc::TextureSetMetadataWrapper textureSetMetadata(m_ntcContext);
+        ntcMaterialCache[ntcData.ToString()] = ntcMaterial;
 
-        fs::path modelPath = material->modelFileName;
+        // Use differnt wrappers for file and memory streams because they have different deleter functions...
+        ntc::FileStreamWrapper ntcFileStream(m_ntcContext);
+        ntc::MemoryStreamWrapper ntcMemoryStream(m_ntcContext);
 
-        if (!LoadMaterialFile(ntcFileName, *ntcMaterial, m_ntcContext, ntcFile, textureSetMetadata))
+        ntcMaterial->textureSetMetadata = std::make_shared<ntc::TextureSetMetadataWrapper>(m_ntcContext);
+
+        if (!LoadMaterialFile(ntcData, *ntcMaterial, m_ntcContext, ntcFileStream, ntcMemoryStream,
+            *ntcMaterial->textureSetMetadata))
             continue;
+
+        // Upcast the file or memory stream to a basic stream type
+        ntc::IStream* const dataStream = ntcFileStream.Get() ? ntcFileStream.Get() : ntcMemoryStream.Get();
+
+        ntc::ITextureSetMetadata* textureSetMetadata = *ntcMaterial->textureSetMetadata;
 
         // Obtain the stream range for latents covering all mip levels of the material.
         ntc::Status ntcStatus = textureSetMetadata->GetStreamRangeForLatents(0, textureSetMetadata->GetDesc().mips,
@@ -1075,13 +1304,21 @@ bool NtcMaterialLoader::LoadMaterialsForScene(donut::engine::Scene& scene, std::
         m_commandList->open();
         bool loadedSuccessfully = true;
 
-        // Load the material data for Inference On Sample/Feedback first, so that the data buffer
-        // can be reused for On Load.
-        if (enableInferenceOnSample || enableInferenceOnFeedback)
+        ntcStatus = textureSetMetadata->ShuffleInferenceOutputs(channelMap.swizzle.data());
+        if (ntcStatus != ntc::Status::Ok)
         {
-            loadedSuccessfully = PrepareMaterialForInferenceOnSample(ntcFile, textureSetMetadata,
-                *ntcMaterial, m_commandList);
+            log::warning("Cannot process material '%s', call to ShuffleInferenceOutputs failed, error code = %s: %s",
+                ntcMaterial->name.c_str(), ntc::StatusToString(ntcStatus), ntc::GetLastErrorMessage());
         }
+
+        // Derive the transcode mapping using the channel map and texture metadata
+        bool const onlyAlphaMask = !enableInferenceOnLoad && !enableInferenceOnFeedback;
+        FillMaterialTranscodeMapping(*ntcMaterial, textureSetMetadata, channelMap, onlyAlphaMask);
+
+        // Load the material data for Inference On Sample/Feedback first, so that the latent and weight buffers
+        // can be reused for On Load.
+        loadedSuccessfully = PrepareMaterialForInferenceOnSample(dataStream, textureSetMetadata,
+            *ntcMaterial, m_commandList);
 
         // Transcode the material into raw color data or BCn (Inference On Load).
         // When Inference on Load is disabled, we still go through the materials and extract alpha mask channels,
@@ -1089,16 +1326,14 @@ bool NtcMaterialLoader::LoadMaterialsForScene(donut::engine::Scene& scene, std::
         // in a path tracing renderer).
         if (loadedSuccessfully)
         {
-            loadedSuccessfully = TranscodeMaterial(ntcFile, textureSetMetadata, *ntcMaterial, m_commandList,
-                enableBlockCompression, !enableInferenceOnLoad);
+            loadedSuccessfully = TranscodeMaterial(dataStream, textureSetMetadata, *ntcMaterial, m_commandList,
+                enableBlockCompression);
         }
 
         if (enableInferenceOnFeedback && loadedSuccessfully)
         {
             loadedSuccessfully = PrepareFeedbackMaterial(feedbackManager, textureSetMetadata, *ntcMaterial,
-                m_commandList, enableBlockCompression);
-            ntcMaterial->textureSetMetadata = std::make_shared<ntc::TextureSetMetadataWrapper>(m_ntcContext);
-            LoadMaterialFile(ntcFileName, *ntcMaterial, m_ntcContext, ntcFile, *ntcMaterial->textureSetMetadata);
+                enableBlockCompression);
         }
         
         m_commandList->close();
@@ -1111,7 +1346,7 @@ bool NtcMaterialLoader::LoadMaterialsForScene(donut::engine::Scene& scene, std::
         }
 
         auto const& textureSetDesc = textureSetMetadata->GetDesc();
-        totalFileSize += ntcFile->Size();
+        totalFileSize += dataStream->Size();
         totalPixels += (textureSetDesc.width * textureSetDesc.height * 4) / 3;
         ++materialCount;
     }
