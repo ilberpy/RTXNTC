@@ -1,5 +1,12 @@
 # RTX Neural Texture Compression SDK Change Log
 
+## 0.7.1 BETA
+
+### LibNTC
+
+- Fixed Cooperative Vector inference on Intel Arc B-series GPUs.
+- Minor code improvements.
+
 ## 0.7.0 BETA
 
 ### LibNTC

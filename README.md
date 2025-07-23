@@ -1,4 +1,4 @@
-# RTX Neural Texture Compression (NTC) SDK v0.7.0 BETA
+# RTX Neural Texture Compression (NTC) SDK v0.7.1 BETA
 
 [Quick Start Guide](#quick-start-guide)
 
