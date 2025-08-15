@@ -4,9 +4,6 @@
 [submodule "external/lodepng"]
 	path = external/lodepng
 	url = https://github.com/lvandeve/lodepng.git
-[submodule "external/DLSS"]
-	path = external/DLSS
-	url = https://github.com/NVIDIA/DLSS.git
 [submodule "libraries/RTXTF-Library"]
 	path = libraries/RTXTF-Library
 	url = ../RTXTF-Library.git
@@ -16,3 +13,6 @@
 [submodule "libraries/RTXTS-TTM"]
 	path = libraries/RTXTS-TTM
 	url = ../RTXTS-TTM.git
+[submodule "external/implot"]
+	path = external/implot
+	url = https://github.com/epezent/implot.git

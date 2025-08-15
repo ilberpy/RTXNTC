@@ -1,4 +1,4 @@
-# RTX Neural Texture Compression (NTC) SDK v0.7.1 BETA
+# RTX Neural Texture Compression (NTC) SDK v0.7.2 BETA
 
 [Quick Start Guide](#quick-start-guide)
 
@@ -216,5 +216,3 @@ Please use GitHub issues or email [rtxntc-sdk-support@nvidia.com](mailto:rtxntc-
 ## License
 
 [NVIDIA RTX SDKs LICENSE](LICENSE.txt)
-
-This project includes NVAPI software. All uses of NVAPI software are governed by the license terms specified here: https://github.com/NVIDIA/nvapi/blob/main/License.txt

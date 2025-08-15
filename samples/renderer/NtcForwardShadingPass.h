@@ -140,7 +140,7 @@ public:
         dm::float3 ambientColorBottom);
 
     void PreparePass(Context& context, nvrhi::ICommandList* commandList, uint32_t frameIndex,
-        bool useSTF, int stfFilterMode, bool hasDepthPrepass, NtcMode ntcMode);
+        bool useSTF, int stfFilterMode, bool hasDepthPrepass, NtcMode ntcMode, float feedbackThreshold);
 
     // IGeometryPass implementation
 

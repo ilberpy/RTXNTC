@@ -1,5 +1,22 @@
 # RTX Neural Texture Compression SDK Change Log
 
+## 0.7.2 BETA
+
+### LibNTC
+
+- Fixed multiple causes for crashes that happened when attempting compression of very large texture sets.
+- Improved inference performance with Cooperative Vectors on DX12.
+
+### Rendering Sample
+
+- Added plots of frame and render time and tile counts.
+- Improved performance of the NTC On Feedback mode by implementing stochastic feedback.
+- Moved the DLSS integration into the Donut framework.
+
+### Command-Line Tool
+
+- Fixed integer overflows when compressing and decompressing very large texture sets.
+
 ## 0.7.1 BETA
 
 ### LibNTC

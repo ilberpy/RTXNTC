@@ -26,6 +26,7 @@
 #define MATERIAL_SAMPLER_SLOT           FORWARD_BINDING_MATERIAL_SAMPLER
 
 #include "donut/shaders/material_bindings.hlsli"
+#include "donut/shaders/hash_based_rng.hlsli"
 
 #include "NtcForwardShadingPassConstants.h"
 
@@ -200,7 +201,6 @@ MaterialTextureSample SampleMaterialTexturesFeedback(float2 texCoord, bool enabl
     return values;
 }
 
-
 #if !ENABLE_ALPHA_TEST
 [earlydepthstencil]
 #endif
@@ -214,10 +214,19 @@ void main(
 #endif
 )
 {
+    bool enableFeedback = true;
+    if (g_Pass.feedbackThreshold < 1.0)
+    {
+        uint2 uniformQuadCoord = uint2(i_position.xy) / 2;
+
+        HashBasedRNG rng = HashBasedRNG::Create2D(uniformQuadCoord, g_Pass.frameIndex);
+        enableFeedback = rng.NextFloat() < g_Pass.feedbackThreshold;
+    }
+
 #if USE_STF
-    MaterialTextureSample textures = SampleMaterialTexturesFeedbackSTF(int2(i_position.xy), i_vtx.texCoord, true);
+    MaterialTextureSample textures = SampleMaterialTexturesFeedbackSTF(int2(i_position.xy), i_vtx.texCoord, enableFeedback);
 #else
-    MaterialTextureSample textures = SampleMaterialTexturesFeedback(i_vtx.texCoord, true);
+    MaterialTextureSample textures = SampleMaterialTexturesFeedback(i_vtx.texCoord, enableFeedback);
 #endif
 
     MaterialConstants materialConstants = g_Material;

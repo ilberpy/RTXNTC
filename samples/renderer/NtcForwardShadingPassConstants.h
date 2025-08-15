@@ -33,6 +33,7 @@ struct NtcForwardShadingPassConstants
 {
     uint frameIndex;
     uint stfFilterMode;
+    float feedbackThreshold;
 };
 
 #endif // NTC_FORWARD_SHADING_PASS_CONSTANTS_H

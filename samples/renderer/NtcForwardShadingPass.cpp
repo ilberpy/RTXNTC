@@ -473,11 +473,12 @@ donut::engine::ViewType::Enum NtcForwardShadingPass::GetSupportedViewTypes() con
 }
 
 void NtcForwardShadingPass::PreparePass(Context& context, nvrhi::ICommandList* commandList, uint32_t frameIndex,
-    bool useSTF, int stfFilterMode, bool hasDepthPrepass, NtcMode ntcMode)
+    bool useSTF, int stfFilterMode, bool hasDepthPrepass, NtcMode ntcMode, float feedbackThreshold)
 {
     NtcForwardShadingPassConstants passConstants {};
     passConstants.frameIndex = frameIndex;
     passConstants.stfFilterMode = stfFilterMode;
+    passConstants.feedbackThreshold = feedbackThreshold;
     commandList->writeBuffer(m_passConstants, &passConstants, sizeof(passConstants));
     context.keyTemplate.hasDepthPrepass = hasDepthPrepass;
     context.keyTemplate.ntcMode = ntcMode;

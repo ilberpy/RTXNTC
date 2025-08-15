@@ -59,3 +59,48 @@ public:
     // Returns the latest average time, if any.
     std::optional<float> getAverageTime();
 };
+
+struct ProfilerRecord
+{
+    double timestamp = 0;
+    double frameTime = 0;
+    double renderTime = 0;
+    double transcodingTime = 0;
+
+    uint32_t tilesTotal = 0;
+    uint32_t tilesAllocated = 0;
+    uint32_t tilesStandby = 0;
+    uint32_t tilesTranscoded = 0;
+};
+
+class SmoothAxisLimit
+{
+public:
+    double GetMaximum() const
+    {
+        return m_maximum;
+    }
+
+    void Update(double newMaximum, double lastFrameTimeSeconds);
+
+private:
+    double m_maximum = 0.0;
+};
+
+class Profiler
+{
+public:
+    Profiler() = default;
+    ProfilerRecord& AddRecord();
+    ProfilerRecord* GetLastRecord();
+    void TrimHistory();
+    void BuildUI(bool enableFeedbackStats);
+
+private:
+    friend class ProfilerGetters;
+    std::chrono::steady_clock::time_point m_appStartTime = std::chrono::steady_clock::now();
+    std::vector<ProfilerRecord> m_profilerHistory;
+    SmoothAxisLimit m_timePlotLimit;
+    SmoothAxisLimit m_tilesPlotLimit;
+    double m_profilerHistoryDuration = 2.0;
+};

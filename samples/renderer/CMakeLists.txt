@@ -20,6 +20,8 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 add_executable(ntc-renderer WIN32)
 
+set(implot_dir ${CMAKE_SOURCE_DIR}/external/implot)
+
 target_sources(ntc-renderer PRIVATE
     NtcChannelMapping.h
     NtcMaterial.h
@@ -32,6 +34,10 @@ target_sources(ntc-renderer PRIVATE
     Profiler.cpp
     Profiler.h
     RenderTargets.h
+    ${implot_dir}/implot_internal.h
+    ${implot_dir}/implot_items.cpp
+    ${implot_dir}/implot.cpp
+    ${implot_dir}/implot.h
 )
 
 file(GLOB feedback_sources
@@ -47,25 +53,9 @@ if (DONUT_WITH_DX12)
     target_sources(ntc-renderer PRIVATE ${feedback_sources})
 endif()
 
-if (TARGET DLSS)
-    target_sources(ntc-renderer PRIVATE 
-        DLSS.cpp
-        DLSS.h
-    )
-    if (DONUT_WITH_DX12)
-        target_sources(ntc-renderer PRIVATE DLSS-DX12.cpp)
-    endif()
-    if (DONUT_WITH_VULKAN)
-        target_sources(ntc-renderer PRIVATE DLSS-VK.cpp)
-    endif()
-
-    target_link_libraries(ntc-renderer PRIVATE DLSS)
-    target_compile_definitions(ntc-renderer PRIVATE NTC_WITH_DLSS=1)
-
+if (DLSS_SHARED_LIBRARY_PATH)
     add_custom_command(TARGET ntc-renderer POST_BUILD COMMAND
         cmake -E copy_if_different "${DLSS_SHARED_LIBRARY_PATH}" "${NTC_BINARY_DIR}/")
-else()
-    target_compile_definitions(ntc-renderer PRIVATE NTC_WITH_DLSS=0)
 endif()
 
 set_target_properties(ntc-renderer PROPERTIES
@@ -106,6 +96,7 @@ target_include_directories(ntc-renderer PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
 target_include_directories(ntc-renderer PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/../../external/donut/shaders")
 target_include_directories(ntc-renderer PRIVATE "${libstf_include_directory}")
 target_include_directories(ntc-renderer PRIVATE "${CMAKE_SOURCE_DIR}/libraries/RTXTS-TTM/include")
+target_include_directories(ntc-renderer PRIVATE "${implot_dir}")
 
 add_custom_target(ntc-renderer-shaders
     DEPENDS ShaderMake

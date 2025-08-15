@@ -15,6 +15,7 @@
 #include <donut/render/DepthPass.h>
 #include <donut/render/SkyPass.h>
 #include <donut/render/TemporalAntiAliasingPass.h>
+#include <donut/render/DLSS.h>
 #include <donut/app/ApplicationBase.h>
 #include <donut/app/Camera.h>
 #include <donut/app/imgui_renderer.h>
@@ -35,6 +36,7 @@
 #include <sstream>
 #include <chrono>
 #include <STFDefinitions.h>
+#include <implot.h>
 #include <argparse.h>
 #include <sstream>
 #include <chrono>
@@ -45,9 +47,6 @@
 #include "NtcForwardShadingPass.h"
 #include "Profiler.h"
 #include "RenderTargets.h"
-#if NTC_WITH_DLSS
-#include "DLSS.h"
-#endif
 
 namespace fs = std::filesystem;
 
@@ -234,7 +233,7 @@ enum class AntiAliasingMode
 {
     Off,
     TAA
-#if NTC_WITH_DLSS
+#if DONUT_WITH_DLSS
     , DLSS
 #endif
 };
@@ -267,10 +266,11 @@ private:
     std::unique_ptr<render::TemporalAntiAliasingPass> m_taaPass;
     AveragingTimerQuery m_prePassTimer;
     AveragingTimerQuery m_renderPassTimer;
+    AveragingTimerQuery m_transcodingTimer;
     std::unique_ptr<NtcMaterialLoader> m_materialLoader;
     std::string m_weightTypes;
-#if NTC_WITH_DLSS
-    std::unique_ptr<DLSS> m_DLSS;
+#if DONUT_WITH_DLSS
+    std::unique_ptr<render::DLSS> m_DLSS;
 #endif
 
     // Feedback mode related members
@@ -294,33 +294,33 @@ private:
     std::string m_screenshotFileName;
     bool m_screenshotWithUI = true;
     bool m_useDepthPrepass = true;
+    bool m_enableStochasticFeedback = true;
+    float m_feedbackThreshold = 0.005f;
 
     size_t m_ntcTextureMemorySize = 0;
     size_t m_transcodedTextureMemorySize = 0;
     size_t m_referenceTextureMemorySize = 0;
+
+    Profiler m_profiler;
 
 public:
     NtcSceneRenderer(app::DeviceManager *deviceManager)
         : ImGui_Renderer(deviceManager)
         , m_prePassTimer(deviceManager->GetDevice())
         , m_renderPassTimer(deviceManager->GetDevice())
+        , m_transcodingTimer(deviceManager->GetDevice())
     {
+        ImPlot::CreateContext();
+
         m_shaderFactory = std::make_shared<engine::ShaderFactory>(GetDevice(), nullptr, fs::path());
         m_commonPasses = std::make_shared<engine::CommonRenderPasses>(GetDevice(), m_shaderFactory);
         m_bindingCache = std::make_unique<engine::BindingCache>(GetDevice());
         m_materialLoader = std::make_unique<NtcMaterialLoader>(GetDevice());
 
-#if NTC_WITH_DLSS
+#if DONUT_WITH_DLSS
     if (g_options.enableDLSS)
     {
-    #if NTC_WITH_DX12
-        if (GetDevice()->getGraphicsAPI() == nvrhi::GraphicsAPI::D3D12)
-            m_DLSS = DLSS::CreateDX12(GetDevice(), *m_shaderFactory);
-    #endif
-    #if NTC_WITH_VULKAN
-        if (GetDevice()->getGraphicsAPI() == nvrhi::GraphicsAPI::VULKAN)
-            m_DLSS = DLSS::CreateVK(GetDevice(), *m_shaderFactory);
-    #endif
+        m_DLSS = render::DLSS::Create(GetDevice(), *m_shaderFactory, app::GetDirectoryWithExecutable().generic_string());
         if (m_DLSS->IsSupported())
             m_aaMode = AntiAliasingMode::DLSS;
     }
@@ -342,6 +342,7 @@ public:
 
     ~NtcSceneRenderer()
     {
+        ImPlot::DestroyContext();
         m_scene.reset();
     }
 
@@ -695,6 +696,13 @@ public:
     {
         ImGui_Renderer::Animate(fElapsedTimeSeconds);
         m_camera.Animate(fElapsedTimeSeconds);
+
+        ProfilerRecord& record = m_profiler.AddRecord();
+        record.frameTime = fElapsedTimeSeconds;
+        record.renderTime = m_renderPassTimer.getLatestAvailableTime().value_or(0.0);
+        record.transcodingTime = m_transcodingTimer.getLatestAvailableTime().value_or(0.0);
+
+        m_profiler.TrimHistory();
     }
 
     void BackBufferResizing() override
@@ -753,7 +761,7 @@ public:
             skyParameters.skyColor * skyParameters.brightness,
             skyParameters.groundColor * skyParameters.brightness);
         m_ntcForwardShadingPass->PreparePass(forwardContext, commandList, GetFrameIndex(),
-            m_useSTF, m_stfFilterMode, m_useDepthPrepass, m_ntcMode);
+            m_useSTF, m_stfFilterMode, m_useDepthPrepass, m_ntcMode, m_enableStochasticFeedback ? m_feedbackThreshold : 1.0f);
 
         m_renderPassTimer.beginQuery(m_commandList);
 
@@ -791,14 +799,23 @@ public:
         nvfeedback::FeedbackTextureCollection tilesThisFrame;
         std::unordered_map<NtcMaterial*, std::vector<nvfeedback::FeedbackTextureTileInfo>> materialsAndTiles;
 
+        ProfilerRecord* profilerRecord = m_profiler.GetLastRecord();
+            
         {
             // Phase 1: Begin frame, readback feedback
             
             m_commandList->open();
 
             // Use 10% of the total number of managed tiles as the target number of extra standby tiles
-            nvfeedback::FeedbackManagerStats statsLastFrame = m_feedbackManager->GetStats();
+            nvfeedback::FeedbackManagerStats const statsLastFrame = m_feedbackManager->GetStats();
             uint32_t standByTileCount = statsLastFrame.tilesTotal / 10;
+
+            if (profilerRecord)
+            {
+                profilerRecord->tilesTotal = statsLastFrame.tilesTotal;
+                profilerRecord->tilesAllocated = statsLastFrame.tilesAllocated;
+                profilerRecord->tilesStandby = statsLastFrame.tilesStandby;
+            }
 
             // Map and transcode only numTilesMax tiles per frame to reduce frametime spikes
             uint32_t numTilesMax = MAX_TILES_PER_FRAME;
@@ -926,6 +943,7 @@ public:
             // Phase 3: Decode NTC texture tiles
 
             m_commandList->open();
+            m_transcodingTimer.beginQuery(m_commandList);
             std::vector<TranscodeTileInfo> tiles;
             for (auto& pair : materialsAndTiles)
             {
@@ -944,6 +962,12 @@ public:
                 m_materialLoader->TranscodeTiles(batch, m_commandList, g_options.blockCompression);
             }
 
+            if (profilerRecord)
+            {
+                profilerRecord->tilesTranscoded = uint32_t(tiles.size());
+            }
+
+            m_transcodingTimer.endQuery(m_commandList);
             m_commandList->close();
             GetDevice()->executeCommandList(m_commandList);
         }
@@ -970,7 +994,7 @@ public:
         m_view.UpdateCache();
 
         // Initialize or resize the DLSS feature
-#if NTC_WITH_DLSS
+#if DONUT_WITH_DLSS
         if (m_aaMode == AntiAliasingMode::DLSS)
         {
             if (m_DLSS)
@@ -1011,10 +1035,18 @@ public:
                 m_commonPasses->BlitTexture(m_commandList, framebuffer, m_renderTargets.resolvedColor, m_bindingCache.get());
                 break;
             }
-#if NTC_WITH_DLSS
+#if DONUT_WITH_DLSS
             case AntiAliasingMode::DLSS:
                 m_taaPass->RenderMotionVectors(m_commandList, m_view, m_previousView);
-                m_DLSS->Render(m_commandList, m_renderTargets, 1.f, !m_previousFrameValid, m_view, m_previousView);
+
+                render::DLSS::EvaluateParameters params;
+                params.depthTexture = m_renderTargets.depth;
+                params.motionVectorsTexture = m_renderTargets.motionVectors;
+                params.inputColorTexture = m_renderTargets.color;
+                params.outputColorTexture = m_renderTargets.resolvedColor;
+                params.resetHistory = !m_previousFrameValid;
+                m_DLSS->Evaluate(m_commandList, params, m_view);
+
                 m_commonPasses->BlitTexture(m_commandList, framebuffer, m_renderTargets.resolvedColor, m_bindingCache.get());
                 break;
 #endif
@@ -1023,8 +1055,6 @@ public:
         m_commandList->close();
         GetDevice()->executeCommandList(m_commandList);
 
-        m_prePassTimer.update();
-        
         // Resolve feedback
         if (m_ntcMode == NtcMode::InferenceOnFeedback)
         {
@@ -1037,7 +1067,9 @@ public:
             GetDevice()->executeCommandList(m_commandList);
         }
 
+        m_prePassTimer.update();
         m_renderPassTimer.update();
+        m_transcodingTimer.update();
         m_previousFrameValid = true;
 
         if (!m_screenshotFileName.empty() && !m_screenshotWithUI)
@@ -1231,7 +1263,7 @@ public:
                 m_aaMode = AntiAliasingMode::TAA;
                 m_previousFrameValid = false;
             }
-#if NTC_WITH_DLSS
+#if DONUT_WITH_DLSS
             ImGui::SameLine();
             ImGui::BeginDisabled(!m_DLSS);
             if (ImGui::RadioButton("DLSS", m_aaMode == AntiAliasingMode::DLSS))
@@ -1251,7 +1283,7 @@ public:
                 constexpr double megabyte = 1'048'576;
                 double tilesTotalMb = double(uint64_t(stats.tilesTotal) * tileSizeInBytes) / megabyte;
                 ImGui::Text("Tiles Total: %d (%.0f MB)", stats.tilesTotal, tilesTotalMb);
-                ImGui::Text("Tiles Allocated: %d (%.0f MB)", stats.tilesAllocated, double(uint64_t(stats.tilesAllocated)* tileSizeInBytes) / megabyte);
+                ImGui::Text("Tiles Allocated: %d (%.0f MB)", stats.tilesAllocated, double(uint64_t(stats.tilesAllocated) * tileSizeInBytes) / megabyte);
                 ImGui::Text("Tiles Standby: %d (%.0f MB)", stats.tilesStandby, double(uint64_t(stats.tilesStandby) * tileSizeInBytes) / megabyte);
                 double tilesHeapAllocatedMb = double(stats.heapAllocationInBytes) / megabyte;
                 ImGui::Text("Heap Allocation: %.0f MB", tilesHeapAllocatedMb);
@@ -1259,6 +1291,7 @@ public:
                 ImGui::Text("NTC Memory: %.0f MB", ntcMemoryMb);
                 double plusNtcMemory = tilesHeapAllocatedMb + ntcMemoryMb;
                 ImGui::Text("Net Memory Savings: %.2fx (%.0f MB)", tilesTotalMb / plusNtcMemory, tilesTotalMb - plusNtcMemory);
+                ImGui::Checkbox("Enable Stochastic Feedback", &m_enableStochasticFeedback);
             }
 
             ImGui::Separator();
@@ -1273,6 +1306,17 @@ public:
             ImGui::Checkbox("Include UI", &m_screenshotWithUI);
         }
         ImGui::End();
+        
+        int windowWidth, windowHeight;
+        GetDeviceManager()->GetWindowDimensions(windowWidth, windowHeight);
+        ImGui::SetNextWindowPos(ImVec2(windowWidth - fontSize * 0.6f, fontSize * 0.6f), 0, ImVec2(1.f, 0.f));
+        if (ImGui::Begin("Profiler", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
+        {
+            m_profiler.BuildUI(m_ntcMode == NtcMode::InferenceOnFeedback);
+        }
+        ImGui::End();
+        
+
         ImGui::PopFont();
     }
 };
@@ -1313,10 +1357,10 @@ int main(int __argc, const char** __argv)
     deviceParams.supportExplicitDisplayScaling = true;
 
     SetNtcGraphicsDeviceParameters(deviceParams, graphicsApi, false, g_ApplicationName);
-#if NTC_WITH_DLSS && NTC_WITH_VULKAN
+#if DONUT_WITH_DLSS && NTC_WITH_VULKAN
     if (graphicsApi == nvrhi::GraphicsAPI::VULKAN)
     {
-        DLSS::GetRequiredVulkanExtensions(deviceParams.optionalVulkanInstanceExtensions, deviceParams.optionalVulkanDeviceExtensions);
+        render::DLSS::GetRequiredVulkanExtensions(deviceParams.optionalVulkanInstanceExtensions, deviceParams.optionalVulkanDeviceExtensions);
     }
 #endif
 

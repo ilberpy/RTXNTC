@@ -41,6 +41,7 @@ parser.add_argument('--tool', default = defaultTool, help = f'Path to the ntc-cl
 parser.add_argument('--verbose', action = 'store_true', help = 'Print the commands before executing them')
 parser.add_argument('--networkVersion', default='auto', help = 'Network version to use for all materials, small...xlarge or auto')
 parser.add_argument('--dryRun', action = 'store_true', help = 'Process materials and write manifest files, but do not compress')
+parser.add_argument('--args', help = 'Custom arguments for the compression tool')
 args = parser.parse_args()
 
 if not os.path.isfile(args.tool):
@@ -396,7 +397,8 @@ for materialIndex in range(len(materialDefinitions)):
             networkVersion=args.networkVersion,
             optimizeBC=True,
             saveCompressed=matdef.ntcFileName,
-            targetPsnr=args.targetPsnr
+            targetPsnr=args.targetPsnr,
+            customArguments=args.args
         )
         
         tasks.append(task)

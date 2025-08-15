@@ -540,7 +540,7 @@ bool SaveImagesFromTextureSet(ntc::IContext* context, ntc::ITextureSet* textureS
             int mipWidth = std::max(1, textureSetDesc.width >> mip);
             int mipHeight = std::max(1, textureSetDesc.height >> mip);
 
-            size_t const mipDataSize = size_t(mipWidth * mipHeight) * size_t(numChannels) * bytesPerComponent;
+            size_t const mipDataSize = size_t(mipWidth) * size_t(mipHeight) * size_t(numChannels) * bytesPerComponent;
             uint8_t* data = (uint8_t*)malloc(mipDataSize);
 
             ntc::ReadChannelsParameters params;
@@ -1456,13 +1456,13 @@ bool SaveCompressedTextureSet(ntc::IContext* context, ntc::ITextureSet* textureS
         return false;
     }
 
-    int texturePixels = 0;
+    size_t texturePixels = 0;
     ntc::TextureSetDesc const& desc = textureSet->GetDesc();
     for (int mip = 0; mip < desc.mips; ++mip)
     {
         int mipWidth = std::max(1, desc.width >> mip);
         int mipHeight = std::max(1, desc.height >> mip);
-        texturePixels += mipWidth * mipHeight;
+        texturePixels += size_t(mipWidth) * size_t(mipHeight);
     }
     uint64_t const fileSize = outputStream->Tell();
     float const bpp = 8.f * float(fileSize) / float(texturePixels);

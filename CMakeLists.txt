@@ -28,6 +28,7 @@ else()
 endif()
 option(DONUT_WITH_VULKAN "" ON)
 option(DONUT_WITH_STATIC_SHADERS "" ON)
+option(DONUT_WITH_DLSS "" ON)
 
 # Register our path for CMake modules
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/support/cmake")
@@ -106,11 +107,6 @@ option(NTC_WITH_DX12 "" "${DONUT_WITH_DX12}")
 option(NTC_WITH_VULKAN "" "${DONUT_WITH_VULKAN}")
 
 add_subdirectory(libraries/RTXNTC-Library)
-
-# Include DLSS and copy its shared lib to the output path
-if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/external/DLSS.cmake")
-    include(external/DLSS.cmake)
-endif()
 
 if (DONUT_WITH_DX12)
     set(DONUT_D3D_AGILITY_SDK_URL "https://www.nuget.org/api/v2/package/Microsoft.Direct3D.D3D12/1.717.1-preview")
